@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Smart Sports Equipment Performance Monitor</title>
+  <meta name="description" content="Monitor bat and racket swings with an MPU6050 + ESP8266: live graphs, swing detection, estimated swing speed, session reports and history. Works in Demo Mode without hardware.">
+  <meta name="theme-color" content="#0b1020">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b1020'/%3E%3Cpath d='M6 22 L13 12 L18 18 L26 8' stroke='%2334d399' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="topbar">
+    <a class="brand" href="#home" aria-label="Home">
+      <svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#16203a"/><path d="M6 22 L13 12 L18 18 L26 8" stroke="#34d399" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Sports Monitor</span>
+    </a>
+    <nav class="nav" aria-label="Main navigation">
+      <a href="#home" data-nav="home">Home</a>
+      <a href="#setup" data-nav="setup">New Session</a>
+      <a href="#live" data-nav="live">Live<span id="nav-live-dot" class="dot-live" hidden title="Session in progress"></span></a>
+      <a href="#history" data-nav="history">History</a>
+    </nav>
+    <div class="top-badges">
+      <span id="mode-badge" class="badge badge-demo" title="Current operating mode">Demo Mode</span>
+      <span id="conn-badge" class="badge badge-off" title="ESP8266 connection status">ESP8266: Disconnected</span>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" role="alert" hidden></div>
+
+  <main id="main" tabindex="-1">
+    <!-- HOME -->
+    <section id="view-home" class="view" aria-labelledby="home-title" hidden>
+      <div class="hero card">
+        <p class="eyebrow">Embedded Systems Project</p>
+        <h1 id="home-title">Smart Sports Equipment Performance Monitor</h1>
+        <p class="lead">Track swings of your cricket bat, badminton racket or tennis racket with an MPU6050 motion sensor on an ESP8266. See live acceleration and rotation, count swings, get an <em>estimated</em> swing speed and review every session. No hardware yet? Demo Mode runs on simulated data.</p>
+        <h2 class="sr-only">Choose your sport</h2>
+        <div id="home-sports" class="sport-grid" role="group" aria-label="Select sport"></div>
+        <div class="actions">
+          <button id="home-start" class="btn btn-primary btn-lg" type="button">Start Session</button>
+          <a id="home-history" class="btn btn-ghost btn-lg" href="#history">View Session History</a>
+        </div>
+      </div>
+
+      <div class="grid g3">
+        <article class="card">
+          <h2 class="card-title">Operating mode</h2>
+          <p id="home-mode" class="big"></p>
+          <p id="home-mode-note" class="muted"></p>
+        </article>
+        <article class="card">
+          <h2 class="card-title">ESP8266 connection</h2>
+          <p id="home-conn" class="big"></p>
+          <p id="home-conn-note" class="muted"></p>
+          <button id="home-check" class="btn btn-ghost btn-sm" type="button">Check connection</button>
+        </article>
+        <article class="card">
+          <h2 class="card-title">Recent activity</h2>
+          <div id="home-recent" class="muted">Loading…</div>
+        </article>
+      </div>
+    </section>
+
+    <!-- SETUP -->
+    <section id="view-setup" class="view" aria-labelledby="setup-title" hidden>
+      <h1 id="setup-title" class="page-title">Session Setup</h1>
+      <form id="setup-form" class="card form" novalidate>
+        <fieldset>
+          <legend>Sport</legend>
+          <div id="setup-sports" class="radio-cards"></div>
+        </fieldset>
+        <label class="field">
+          <span>Session name <small>(optional)</small></span>
+          <input id="setup-name" type="text" maxlength="80" placeholder="e.g. Nets practice, forehand drills" autocomplete="off">
+        </label>
+        <fieldset>
+          <legend>Data source</legend>
+          <div class="radio-cards">
+            <label class="rcard"><input type="radio" name="mode" value="demo"><span><strong>Demo Mode</strong><small>Simulated sensor data. No hardware needed.</small></span></label>
+            <label class="rcard"><input type="radio" name="mode" value="live"><span><strong>Live Hardware Mode</strong><small>Real MPU6050 readings from the ESP8266.</small></span></label>
+          </div>
+        </fieldset>
+        <div id="live-settings" class="live-settings" hidden>
+          <div class="row">
+            <label class="field grow"><span>ESP8266 IP address</span><input id="setup-host" type="text" inputmode="decimal" placeholder="192.168.1.50" autocomplete="off"></label>
+            <label class="field port"><span>Port</span><input id="setup-port" type="number" min="1" max="65535" placeholder="81"></label>
+            <button id="setup-test" class="btn btn-ghost" type="button">Test connection</button>
+          </div>
+          <p id="setup-live-status" class="notice" role="status"></p>
+        </div>
+        <p id="setup-error" class="notice notice-bad" role="alert" hidden></p>
+        <div class="actions">
+          <button id="setup-start" class="btn btn-primary btn-lg" type="submit">Start Session</button>
+          <a class="btn btn-ghost btn-lg" href="#home">Cancel</a>
+        </div>
+      </form>
+    </section>
+
+    <!-- LIVE -->
+    <section id="view-live" class="view" aria-labelledby="live-title" hidden>
+      <div class="live-head">
+        <div>
+          <h1 id="live-title" class="page-title">Live Monitoring</h1>
+          <p id="live-sub" class="muted"></p>
+        </div>
+        <div class="live-badges">
+          <span id="live-source" class="badge badge-demo"></span>
+          <span id="live-state" class="badge badge-off"></span>
+        </div>
+      </div>
+      <p id="live-note" class="notice" hidden></p>
+      <div class="controls" role="group" aria-label="Session controls">
+        <button id="btn-start" class="btn btn-primary" type="button">Start</button>
+        <button id="btn-pause" class="btn btn-warn" type="button">Pause</button>
+        <button id="btn-resume" class="btn btn-primary" type="button">Resume</button>
+        <button id="btn-stop" class="btn btn-danger" type="button">Stop &amp; Generate Report</button>
+        <button id="btn-reset-sim" class="btn btn-ghost" type="button" title="Restart the simulated motion pattern (demo only)">Reset simulator</button>
+      </div>
+
+      <div id="live-empty" class="card empty" hidden>
+        <h2>No active session</h2>
+        <p class="muted">Press <strong>Start</strong> to begin a new session with the current setup, or open Session Setup to change sport and mode.</p>
+        <a class="btn btn-ghost" href="#setup">Open Session Setup</a>
+      </div>
+
+      <div id="live-body">
+        <div class="grid g-stats">
+          <div class="stat"><span class="stat-l">Duration</span><span id="st-duration" class="stat-v">00:00</span><span class="stat-u">active time</span></div>
+          <div class="stat"><span class="stat-l">Swings</span><span id="st-swings" class="stat-v">0</span><span class="stat-u">detected</span></div>
+          <div class="stat"><span class="stat-l">Avg est. speed</span><span id="st-avg" class="stat-v">—</span><span class="stat-u">km/h (estimate)</span></div>
+          <div class="stat"><span class="stat-l">Max est. speed</span><span id="st-max" class="stat-v">—</span><span class="stat-u">km/h (estimate)</span></div>
+          <div class="stat"><span class="stat-l">Max |a|</span><span id="st-maxa" class="stat-v">—</span><span class="stat-u">g</span></div>
+          <div class="stat"><span class="stat-l">Last swing</span><span id="st-last" class="stat-v">—</span><span id="st-last-u" class="stat-u">&nbsp;</span></div>
+        </div>
+
+        <div class="grid g2">
+          <section class="card" aria-labelledby="acc-title">
+            <h2 id="acc-title" class="card-title">Accelerometer <small>(g)</small></h2>
+            <div class="readouts">
+              <div><span class="dot c-x"></span>X <b id="v-ax">—</b></div>
+              <div><span class="dot c-y"></span>Y <b id="v-ay">—</b></div>
+              <div><span class="dot c-z"></span>Z <b id="v-az">—</b></div>
+              <div><span class="dot c-m"></span>|a| <b id="v-am">—</b></div>
+            </div>
+            <div class="chart-wrap"><canvas id="chart-accel" role="img" aria-label="Live acceleration graph"></canvas></div>
+          </section>
+          <section class="card" aria-labelledby="gyr-title">
+            <h2 id="gyr-title" class="card-title">Gyroscope <small>(°/s)</small></h2>
+            <div class="readouts">
+              <div><span class="dot c-x"></span>X <b id="v-gx">—</b></div>
+              <div><span class="dot c-y"></span>Y <b id="v-gy">—</b></div>
+              <div><span class="dot c-z"></span>Z <b id="v-gz">—</b></div>
+              <div><span class="dot c-m"></span>|ω| <b id="v-gm">—</b></div>
+            </div>
+            <div class="chart-wrap"><canvas id="chart-gyro" role="img" aria-label="Live angular velocity graph"></canvas></div>
+          </section>
+        </div>
+        <p class="muted small">Graphs show the last <span id="win-s"></span> s. The complete session is recorded separately for the report. Speed values are <strong>estimates</strong> (ω × assumed radius), not ball speed.</p>
+      </div>
+    </section>
+
+    <!-- REPORT -->
+    <section id="view-report" class="view" aria-labelledby="report-title" hidden>
+      <div id="report-content"></div>
+    </section>
+
+    <!-- HISTORY -->
+    <section id="view-history" class="view" aria-labelledby="history-title" hidden>
+      <div class="live-head">
+        <h1 id="history-title" class="page-title">Session History</h1>
+        <div class="actions">
+          <button id="hist-import" class="btn btn-ghost" type="button">Import JSON</button>
+          <button id="hist-export-all" class="btn btn-ghost" type="button">Export all</button>
+          <a class="btn btn-primary" href="#setup">New Session</a>
+        </div>
+      </div>
+      <p class="muted small">Sessions are stored in this browser only. They are not synced between devices and are lost if site data is cleared — export a backup to keep them.</p>
+      <div id="history-list" class="history-list" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <input id="import-file" type="file" accept=".json,application/json" hidden>
+  <dialog id="confirm" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <h2 id="confirm-title">Confirm</h2>
+      <p id="confirm-text"></p>
+      <div class="actions end">
+        <button id="confirm-cancel" class="btn btn-ghost" value="cancel">Cancel</button>
+        <button id="confirm-ok" class="btn btn-danger" value="ok">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <script src="vendor/chart.umd.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
