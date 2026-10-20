@@ -72,6 +72,27 @@
           <legend>Sport</legend>
           <div id="setup-sports" class="radio-cards"></div>
         </fieldset>
+        <fieldset class="equip-config">
+          <legend>Equipment Configuration</legend>
+          <p class="muted small" id="equip-note" style="margin: 0 0 10px;">Sensor mounted below grip near the butt end. Enter equipment dimensions (excluding sensor module mass).</p>
+          <div class="row">
+            <label class="field grow">
+              <span id="equip-len-label">Equipment length <small>(inches)</small></span>
+              <div class="input-unit-wrap">
+                <input id="setup-equip-length" type="number" step="0.1" placeholder="27.0" autocomplete="off" required>
+                <span class="unit-suffix">in</span>
+              </div>
+            </label>
+            <label class="field grow">
+              <span id="equip-weight-label">Equipment weight <small>(grams)</small></span>
+              <div class="input-unit-wrap">
+                <input id="setup-equip-weight" type="number" step="1" placeholder="300" autocomplete="off" required>
+                <span class="unit-suffix">g</span>
+              </div>
+            </label>
+          </div>
+          <p id="equip-validation-error" class="notice notice-bad" role="alert" hidden></p>
+        </fieldset>
         <label class="field">
           <span>Session name <small>(optional)</small></span>
           <input id="setup-name" type="text" maxlength="80" placeholder="e.g. Nets practice, forehand drills" autocomplete="off">
@@ -192,6 +213,35 @@
         <button id="confirm-ok" class="btn btn-danger" value="ok">Confirm</button>
       </div>
     </form>
+  </dialog>
+
+  <!-- EXPANDED GRAPH MODAL -->
+  <dialog id="chart-modal" class="chart-modal" aria-labelledby="modal-chart-title">
+    <div class="chart-modal-content">
+      <div class="modal-header">
+        <div>
+          <h2 id="modal-chart-title" class="modal-title">Graph</h2>
+          <p id="modal-chart-sub" class="muted small">Drag to pan along the time axis · Mouse wheel or touch pinch to zoom</p>
+        </div>
+        <div class="modal-toolbar" role="toolbar" aria-label="Chart zoom and pan controls">
+          <button id="btn-zoom-in" class="btn btn-ghost btn-sm" type="button" title="Zoom in">🔍+ Zoom In</button>
+          <button id="btn-zoom-out" class="btn btn-ghost btn-sm" type="button" title="Zoom out">🔍− Zoom Out</button>
+          <button id="btn-pan-left" class="btn btn-ghost btn-sm" type="button" title="Pan left along timeline">◀ Pan Left</button>
+          <button id="btn-pan-right" class="btn btn-ghost btn-sm" type="button" title="Pan right along timeline">Pan Right ▶</button>
+          <button id="btn-zoom-reset" class="btn btn-ghost btn-sm" type="button" title="Reset zoom to complete session">↺ Full Session</button>
+          <button id="btn-modal-close" class="btn btn-ghost btn-sm btn-close" type="button" aria-label="Close expanded graph">✕ Close</button>
+        </div>
+      </div>
+      <div class="modal-chart-body">
+        <div class="modal-chart-wrap">
+          <canvas id="modal-chart-canvas" role="img" aria-label="Expanded interactive graph"></canvas>
+        </div>
+        <div class="modal-chart-footer">
+          <span id="modal-chart-range" class="muted small">Visible Range: 0.0 s – 0.0 s</span>
+          <span class="muted small">Hover / tap points for detailed measurements with units. Esc or outside click closes.</span>
+        </div>
+      </div>
+    </div>
   </dialog>
   <div id="toasts" class="toasts" aria-live="polite"></div>
 

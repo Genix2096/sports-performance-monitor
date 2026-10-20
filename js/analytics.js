@@ -3,12 +3,85 @@
  *
  * Units: acceleration in g, angular velocity in degrees/second (dps), time in ms.
  */
-import { CONFIG } from './config.js';
+import { CONFIG, INCHES_TO_METERS } from './config.js';
 
 export const SAMPLE_FIELDS = ['ax', 'ay', 'az', 'gx', 'gy', 'gz'];
 
 export function magnitude(x, y, z) {
   return Math.sqrt(x * x + y * y + z * z);
+}
+
+export function inchesToMeters(inches) {
+  if (typeof inches !== 'number' || !Number.isFinite(inches)) return null;
+  return inches * INCHES_TO_METERS;
+}
+
+/**
+ * Validate equipment length (inches) and weight (grams) against sport limits.
+ * Rejects blank, zero, negative, NaN/Infinity, or physically unreasonable values.
+ * Does NOT replace invalid inputs with defaults.
+ */
+export function validateEquipment(sport, eq) {
+  const cfg = CONFIG.sports[sport];
+  if (!cfg) return { valid: false, error: `Unknown sport "${sport}".` };
+  if (!eq || typeof eq !== 'object') return { valid: false, error: 'Equipment details missing.' };
+
+  let lengthInches = eq.lengthInches;
+  if (typeof lengthInches === 'string' && lengthInches.trim() !== '') lengthInches = Number(lengthInches);
+  if (lengthInches === undefined || lengthInches === null || lengthInches === '') {
+    return { valid: false, error: `Please enter the ${cfg.equipment} length in inches.` };
+  }
+  if (typeof lengthInches !== 'number' || !Number.isFinite(lengthInches) || lengthInches <= 0) {
+    return { valid: false, error: `${cfg.label} ${cfg.equipment} length must be a finite, positive number.` };
+  }
+  const { minLengthInches, maxLengthInches, minWeightGrams, maxWeightGrams } = cfg.equipmentLimits;
+  if (lengthInches < minLengthInches || lengthInches > maxLengthInches) {
+    return {
+      valid: false,
+      error: `${cfg.label} ${cfg.equipment} length must be between ${minLengthInches} and ${maxLengthInches} inches.`,
+    };
+  }
+
+  let weightGrams = eq.weightGrams;
+  if (typeof weightGrams === 'string' && weightGrams.trim() !== '') weightGrams = Number(weightGrams);
+  if (weightGrams === undefined || weightGrams === null || weightGrams === '') {
+    return { valid: false, error: `Please enter the ${cfg.equipment} weight in grams.` };
+  }
+  if (typeof weightGrams !== 'number' || !Number.isFinite(weightGrams) || weightGrams <= 0) {
+    return { valid: false, error: `${cfg.label} ${cfg.equipment} weight must be a finite, positive number.` };
+  }
+  if (weightGrams < minWeightGrams || weightGrams > maxWeightGrams) {
+    return {
+      valid: false,
+      error: `${cfg.label} ${cfg.equipment} weight must be between ${minWeightGrams} and ${maxWeightGrams} grams.`,
+    };
+  }
+
+  return {
+    valid: true,
+    lengthInches: Math.round(lengthInches * 10) / 10,
+    weightGrams: Math.round(weightGrams),
+  };
+}
+
+/**
+ * Calculate the effective rotation radius (in metres) from equipment length:
+ *   - The sensor is mounted below the grip near the butt end for all sports.
+ *   - The rotation axis (wrist/arm anatomical pivot) is located proximal to the butt end by pivotOffsetM.
+ *   - The hitting zone / sweet spot is located at sweetSpotRatio along the equipment length.
+ *   - Effective radius r_eff = pivotOffsetM + sweetSpotRatio * (lengthInches * 0.0254).
+ *   - If lengthInches is omitted or invalid, returns the configured default radiusM.
+ */
+export function calculateEffectiveRadius(sport, lengthInches) {
+  const cfg = CONFIG.sports[sport];
+  if (!cfg) return 0.75;
+  if (typeof lengthInches === 'number' && Number.isFinite(lengthInches) && lengthInches > 0) {
+    const lengthM = lengthInches * INCHES_TO_METERS;
+    const { pivotOffsetM, sweetSpotRatio } = cfg.biomechanics || { pivotOffsetM: 0.2, sweetSpotRatio: 0.75 };
+    const r = pivotOffsetM + sweetSpotRatio * lengthM;
+    return Math.round(r * 1000) / 1000;
+  }
+  return cfg.radiusM;
 }
 
 /**
@@ -32,13 +105,20 @@ export function normalizeSample(raw) {
 }
 
 /**
- * Estimated linear speed of the point at distance `radiusM` from the rotation axis:
+ * Estimated linear speed of the hitting zone at distance `radiusM` from the rotation axis:
  *   v = omega * r   (omega in rad/s = dps * pi / 180)
- * This is a rough ESTIMATE of tip/hitting-zone speed. It is NOT ball speed and
- * depends entirely on the assumed radius and on where the sensor is mounted.
+ *
+ * Documented Physical Model & Assumptions:
+ * 1. Rotation is modeled about an effective pivot axis behind the butt end (wrist/arm joint center).
+ * 2. Sensor is mounted below the grip near the butt end of the equipment.
+ * 3. The gyroscope measures the angular velocity magnitude of the rigid equipment frame.
+ * 4. Equipment length determines the hitting zone distance via the effective radius model.
+ * 5. Weight is recorded as equipment metadata and is NOT used as an arbitrary speed multiplier.
+ * 6. This is an ESTIMATE of the equipment hitting-zone linear speed, NOT ball speed or impact force.
  */
 export function estimateSwingSpeed(peakDps, radiusM) {
-  const ms = (peakDps * Math.PI / 180) * radiusM;
+  const r = Number.isFinite(radiusM) && radiusM > 0 ? radiusM : 0.75;
+  const ms = (peakDps * Math.PI / 180) * r;
   return { ms, kmh: ms * 3.6 };
 }
 
@@ -167,16 +247,21 @@ export function fmt(v, digits = 1, unit = '') {
 }
 
 /** Plain-language summary generated from actual metrics. */
-export function buildSummaryText(m, sportLabel, mode) {
+export function buildSummaryText(m, sportLabel, mode, equipment = null) {
   const parts = [];
   const dur = formatDuration(m.activeDurationMs ?? m.durationMs);
   const src = mode === 'demo' ? 'simulated (demo) data' : 'live sensor data';
   parts.push(`This ${sportLabel.toLowerCase()} session lasted ${dur} of active time and is based on ${src}.`);
+  if (equipment && Number.isFinite(equipment.lengthInches) && Number.isFinite(equipment.weightGrams)) {
+    parts.push(`Equipment: ${equipment.lengthInches}" length, ${equipment.weightGrams} g weight (sensor mounted below grip).`);
+  } else {
+    parts.push('Equipment details not recorded.');
+  }
   if (!m.totalSwings) {
     parts.push('No swings were detected. If this was a live session, the detector thresholds may need tuning to your equipment.');
   } else {
     parts.push(`${m.totalSwings} swing${m.totalSwings === 1 ? '' : 's'} detected (${fmt(m.swingsPerMinute, 1)} per minute).`);
-    parts.push(`Estimated swing speed averaged ${fmt(m.avgSpeedKmh)} km/h with a maximum of ${fmt(m.maxSpeedKmh)} km/h (estimate from gyroscope and an assumed radius, not ball speed).`);
+    parts.push(`Estimated swing speed averaged ${fmt(m.avgSpeedKmh)} km/h with a maximum of ${fmt(m.maxSpeedKmh)} km/h (estimate from gyroscope and effective rotation radius, not ball speed).`);
     parts.push(`Peak angular velocity reached ${fmt(m.maxGyroDps, 0)} °/s and peak acceleration ${fmt(m.maxAccelG, 2)} g.`);
     const c = m.consistency;
     if (!c || c.score === null) parts.push('Consistency: insufficient data (at least 3 swings are needed).');

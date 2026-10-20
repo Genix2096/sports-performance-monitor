@@ -6,18 +6,20 @@ import { CONFIG, SPORT_IDS } from './config.js';
 import { Session } from './session.js';
 import { DemoSource } from './simulator.js';
 import { LiveSensor, CONN, CONN_LABEL } from './sensor.js';
-import { magnitude, fmt, formatDuration, downsampleRows, buildSummaryText } from './analytics.js';
+import { magnitude, fmt, formatDuration, downsampleRows, buildSummaryText, validateEquipment } from './analytics.js';
 import { saveSession, listSessions, getSession, deleteSession, importRecords } from './storage.js';
 import { parseImportText, toExportBundle, toCsv } from './schema.js';
-import { createChart, updateLive, setReport } from './charts.js';
+import { createChart, updateLive, setReport, SPEC, zoomChart, panChart, resetChartZoom, attachInteractiveControls } from './charts.js';
 
 const $ = (id) => document.getElementById(id);
 const EMOJI = { cricket: '🏏', badminton: '🏸', tennis: '🎾' };
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const sportLabel = (id) => CONFIG.sports[id]?.label || id;
 
-/* ------------------------------ settings ------------------------------ */
+/* ------------------------------ settings & equipment ------------------------------ */
 const SETTINGS_KEY = 'spm.settings.v1';
+const EQUIPMENT_KEY = 'spm.equipment.v1';
+
 const settings = { sport: 'cricket', mode: 'demo', name: '', host: CONFIG.esp.host, port: CONFIG.esp.port };
 try {
   Object.assign(settings, JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'));
@@ -26,6 +28,23 @@ if (!SPORT_IDS.includes(settings.sport)) settings.sport = 'cricket';
 if (settings.mode !== 'demo' && settings.mode !== 'live') settings.mode = 'demo';
 function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch { /* storage may be blocked */ }
+}
+
+const equipmentStore = {};
+for (const id of SPORT_IDS) {
+  equipmentStore[id] = { ...CONFIG.sports[id].equipmentDefaults };
+}
+try {
+  const savedEq = JSON.parse(localStorage.getItem(EQUIPMENT_KEY) || '{}');
+  for (const id of SPORT_IDS) {
+    if (savedEq[id] && typeof savedEq[id] === 'object') {
+      const v = validateEquipment(id, savedEq[id]);
+      if (v.valid) equipmentStore[id] = { lengthInches: v.lengthInches, weightGrams: v.weightGrams };
+    }
+  }
+} catch { /* storage may be blocked */ }
+function saveEquipmentStore() {
+  try { localStorage.setItem(EQUIPMENT_KEY, JSON.stringify(equipmentStore)); } catch { /* storage may be blocked */ }
 }
 
 /* ------------------------------ state ------------------------------ */
@@ -40,11 +59,15 @@ let routeToken = 0;
 const unsaved = new Map(); // records that failed to save (kept in memory so they can still be exported)
 const charts = { accel: null, gyro: null };
 let reportCharts = [];
+let modalChart = null;
+let modalRemoveControls = null;
+let modalActiveRec = null;
 
 const live = new LiveSensor({
   onState: () => { updateChrome(); refreshConnectionUi(); },
   onSample: (s) => handleSample(s),
   onInvalid: () => { /* counted inside LiveSensor; shown in live note */ scheduleRender(); },
+  onDisconnect: () => { if (active) active.triggerRebase(); },
 });
 
 /* ------------------------------ UI helpers ------------------------------ */
@@ -120,7 +143,7 @@ function refreshConnectionUi() {
 
 function ensureLiveConnection() {
   const sameTarget = live.host === settings.host && live.port === settings.port;
-  if (live.wantOpen && sameTarget) return;
+  if (live.wantOpen && sameTarget && (live.state === CONN.CONNECTED || live.state === CONN.CONNECTING)) return;
   live.connect(settings.host, settings.port);
 }
 
@@ -128,18 +151,37 @@ function liveNoteFor(state) {
   switch (state) {
     case CONN.CONNECTED: return { kind: 'ok', text: 'ESP8266 connected and streaming real sensor data.' };
     case CONN.CONNECTING: return { kind: 'warn', text: live.detail || 'Connecting to the ESP8266…' };
+    case CONN.RECONNECTING: return { kind: 'warn', text: live.detail || 'Connection lost. Reconnecting…' };
     case CONN.SENSOR_UNAVAILABLE: return { kind: 'bad', text: `ESP8266 reachable but the MPU6050 is not responding. ${live.detail} Check wiring: VCC→3V3, GND→GND, SDA→D2, SCL→D1.` };
     case CONN.CONNECTION_LOST: return { kind: 'bad', text: `Connection lost. ${live.detail} Retrying automatically…` };
     default: return { kind: 'bad', text: live.detail && live.detail !== 'Not connected.' ? live.detail : 'ESP8266 not connected. Live Hardware Mode needs the ESP8266 — use “Test connection”, or choose Demo Mode.' };
   }
 }
 
-/* ------------------------------ sport selection ------------------------------ */
+/* ------------------------------ sport selection & equipment ------------------------------ */
 function setSport(id) {
   settings.sport = id;
   saveSettings();
   renderSports();
+  renderSetupEquipment();
   updateLiveHeader();
+}
+
+function renderSetupEquipment() {
+  const sport = settings.sport;
+  const cfg = CONFIG.sports[sport];
+  if (!cfg) return;
+  const cur = equipmentStore[sport] || cfg.equipmentDefaults;
+  const lenEl = $('setup-equip-length');
+  const wtEl = $('setup-equip-weight');
+  if (lenEl) lenEl.value = cur.lengthInches;
+  if (wtEl) wtEl.value = cur.weightGrams;
+  const lenLbl = $('equip-len-label');
+  const wtLbl = $('equip-weight-label');
+  if (lenLbl) lenLbl.innerHTML = `${cfg.label} ${cfg.equipment} length <small>(inches)</small>`;
+  if (wtLbl) wtLbl.innerHTML = `${cfg.label} ${cfg.equipment} weight <small>(grams)</small>`;
+  const err = $('equip-validation-error');
+  if (err) err.hidden = true;
 }
 
 function renderSports() {
@@ -179,6 +221,7 @@ async function renderHome(token) {
 /* ------------------------------ SETUP ------------------------------ */
 function renderSetup() {
   renderSports();
+  renderSetupEquipment();
   $('setup-name').value = settings.name || '';
   document.querySelector(`input[name=mode][value=${settings.mode}]`).checked = true;
   $('setup-host').value = settings.host;
@@ -208,12 +251,31 @@ function readHostPort() {
 function startFromSetup(ev) {
   ev.preventDefault();
   const err = $('setup-error');
+  const equipErr = $('equip-validation-error');
   err.hidden = true;
+  if (equipErr) equipErr.hidden = true;
+
   if (active) {
     err.textContent = 'A session is already active. Stop it from the Live screen before starting another.';
     err.hidden = false;
     return;
   }
+
+  // Validate equipment configuration
+  const lenRaw = $('setup-equip-length').value;
+  const wtRaw = $('setup-equip-weight').value;
+  const eqValidation = validateEquipment(settings.sport, { lengthInches: lenRaw, weightGrams: wtRaw });
+  if (!eqValidation.valid) {
+    equipErr.textContent = eqValidation.error;
+    equipErr.hidden = false;
+    $('setup-equip-length').focus();
+    return;
+  }
+
+  // Persist valid equipment configuration per sport
+  equipmentStore[settings.sport] = { lengthInches: eqValidation.lengthInches, weightGrams: eqValidation.weightGrams };
+  saveEquipmentStore();
+
   settings.name = $('setup-name').value.trim();
   if (settings.mode === 'live') {
     const hp = readHostPort();
@@ -222,14 +284,15 @@ function startFromSetup(ev) {
     settings.port = hp.port;
   }
   saveSettings();
-  startSession();
+  startSession({ lengthInches: eqValidation.lengthInches, weightGrams: eqValidation.weightGrams });
   location.hash = '#live';
 }
 
 /* ------------------------------ SESSION LIFECYCLE ------------------------------ */
-function startSession() {
+function startSession(equipmentSnapshot = null) {
   if (active) { toast('A session is already running.', 'warn'); return false; }
-  active = new Session({ sport: settings.sport, name: settings.name, mode: settings.mode });
+  const eq = equipmentSnapshot || { ...equipmentStore[settings.sport] };
+  active = new Session({ sport: settings.sport, name: settings.name, mode: settings.mode, equipment: eq });
   active.start();
   liveRows = [];
   latest = null;
@@ -446,6 +509,9 @@ async function renderReport(id, token) {
     ${rec.mode === 'demo' ? '<p class="notice notice-warn">These results come from simulated sensor data and do not describe a real physical swing.</p>' : ''}
     <div class="report-grid">
       ${tile('Sport', esc(label))}
+      ${rec.equipment && Number.isFinite(rec.equipment.lengthInches) && Number.isFinite(rec.equipment.weightGrams)
+        ? tile('Equipment', `${rec.equipment.lengthInches}" · ${rec.equipment.weightGrams} g`, `${CONFIG.sports[rec.sport]?.equipment || 'equipment'} (below grip)`)
+        : tile('Equipment', 'Not recorded', 'older session format')}
       ${tile('Active duration', formatDuration(rec.activeDurationMs), 'paused time excluded')}
       ${tile('Total swings', m.totalSwings, `${fmt(m.swingsPerMinute, 1)} per minute`)}
       ${tile('Avg est. swing speed', fmt(m.avgSpeedKmh), 'km/h (estimate)')}
@@ -455,11 +521,30 @@ async function renderReport(id, token) {
       ${tile('Max acceleration', fmt(m.maxAccelG, 2), 'g (magnitude)')}
       ${tile('Swing consistency', c.score === null ? 'Insufficient data' : `${c.score}/100`, c.score === null ? 'needs ≥ 3 swings' : `${c.status} · peak ω CV ${(c.cv * 100).toFixed(0)}%`)}
     </div>
-    <section class="card summary"><h2 class="card-title">Performance summary</h2><p style="margin:0">${esc(buildSummaryText(m, label, rec.mode))}</p>
-      <p class="muted small" style="margin:10px 0 0">Estimated swing speed = peak angular velocity × assumed effective radius (${rec.settings.radiusM} m). It is an estimate of the hitting-zone speed, not ball speed, impact force or shot accuracy.${rec.storedStride > 1 ? ` Graph data was thinned (every ${rec.storedStride}th sample stored); statistics use all samples.` : ''}</p></section>
-    <div class="grid g2">
-      <section class="card"><h2 class="card-title">Acceleration <small>(g) — full session</small></h2><div class="chart-wrap tall"><canvas id="rep-accel" role="img" aria-label="Session acceleration graph"></canvas></div></section>
-      <section class="card"><h2 class="card-title">Angular velocity <small>(°/s) — full session</small></h2><div class="chart-wrap tall"><canvas id="rep-gyro" role="img" aria-label="Session angular velocity graph"></canvas></div></section>
+    <section class="card summary"><h2 class="card-title">Performance summary</h2><p style="margin:0">${esc(buildSummaryText(m, label, rec.mode, rec.equipment))}</p>
+      <p class="muted small" style="margin:10px 0 0">Estimated swing speed = peak angular velocity × effective radius (${rec.settings.radiusM} m). Calculated from equipment dimensions and rotation geometry (sensor mounted below grip). It is an estimate of hitting-zone speed, NOT ball speed or impact force.${rec.storedStride > 1 ? ` Graph data was thinned (every ${rec.storedStride}th sample stored); statistics use all samples.` : ''}</p></section>
+    <div class="grid g3">
+      <section class="card chart-card-interactive" data-kind="accel" role="button" tabindex="0" aria-label="Click to expand acceleration graph">
+        <div class="chart-head-actions">
+          <h2 class="card-title" style="margin:0">Acceleration <small>(g) — full session</small></h2>
+          <span class="btn-expand-badge" title="Expand graph">Expand ⛶</span>
+        </div>
+        <div class="chart-wrap tall"><canvas id="rep-accel" role="img" aria-label="Session acceleration graph"></canvas></div>
+      </section>
+      <section class="card chart-card-interactive" data-kind="gyro" role="button" tabindex="0" aria-label="Click to expand angular velocity graph">
+        <div class="chart-head-actions">
+          <h2 class="card-title" style="margin:0">Angular velocity <small>(°/s) — full session</small></h2>
+          <span class="btn-expand-badge" title="Expand graph">Expand ⛶</span>
+        </div>
+        <div class="chart-wrap tall"><canvas id="rep-gyro" role="img" aria-label="Session angular velocity graph"></canvas></div>
+      </section>
+      <section class="card chart-card-interactive" data-kind="speed" role="button" tabindex="0" aria-label="Click to expand estimated speed graph">
+        <div class="chart-head-actions">
+          <h2 class="card-title" style="margin:0">Estimated Speed <small>(km/h) — full session</small></h2>
+          <span class="btn-expand-badge" title="Expand graph">Expand ⛶</span>
+        </div>
+        <div class="chart-wrap tall"><canvas id="rep-speed" role="img" aria-label="Session estimated speed graph"></canvas></div>
+      </section>
     </div>
     <section class="card"><h2 class="card-title">Detected swings</h2>
       ${rec.swings.length ? `<div class="table-scroll"><table><thead><tr><th>#</th><th>Time (s)</th><th>Peak ω (°/s)</th><th>Peak |a| (g)</th><th>Duration (ms)</th><th>Est. speed (km/h)</th></tr></thead><tbody>${rec.swings.map((s, i) => `<tr><td>${i + 1}</td><td>${(s.t / 1000).toFixed(1)}</td><td>${s.peakDps.toFixed(0)}</td><td>${s.peakG.toFixed(2)}</td><td>${s.durationMs.toFixed(0)}</td><td>${s.speedKmh.toFixed(1)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted">No swings detected in this session.</p>'}
@@ -478,16 +563,87 @@ async function renderReport(id, token) {
   $('rep-retry')?.addEventListener('click', async () => {
     try { await saveSession(rec); unsaved.delete(rec.id); banner(''); toast('Session saved.'); renderReport(rec.id, routeToken); } catch (e) { toast(`Save failed: ${e.message}`, 'bad'); }
   });
+
+  box.querySelectorAll('.chart-card-interactive').forEach((card) => {
+    const open = () => openExpandedChart(card.dataset.kind, rec);
+    card.addEventListener('click', open);
+    card.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        open();
+      }
+    });
+  });
+
   if (window.Chart) {
+    const totalSec = (rec.activeDurationMs || 0) / 1000;
     const rows = downsampleRows(rec.samples, CONFIG.charts.reportMaxPoints);
     const a = createChart($('rep-accel'), 'accel');
     const g = createChart($('rep-gyro'), 'gyro');
-    setReport(a, rows, rec.swings);
-    setReport(g, rows, rec.swings);
-    reportCharts = [a, g];
+    const s = createChart($('rep-speed'), 'speed', { radiusM: rec.settings.radiusM });
+    setReport(a, rows, rec.swings, totalSec);
+    setReport(g, rows, rec.swings, totalSec);
+    setReport(s, rows, rec.swings, totalSec);
+    reportCharts = [a, g, s];
   } else {
     banner('Chart.js failed to load; report graphs are unavailable.');
   }
+}
+
+function updateModalRangeLabel() {
+  if (!modalChart) return;
+  const min = modalChart.options.scales.x.min ?? 0;
+  const max = modalChart.options.scales.x.max ?? (modalChart._totalDurationS || 0);
+  const total = modalChart._totalDurationS || 0;
+  const el = $('modal-chart-range');
+  if (el) el.textContent = `Visible: ${min.toFixed(2)} s – ${max.toFixed(2)} s (Total: ${total.toFixed(1)} s)`;
+}
+
+function openExpandedChart(kind, rec) {
+  if (!window.Chart || !rec) return;
+  modalActiveRec = rec;
+  const dialog = $('chart-modal');
+  const spec = SPEC[kind] || SPEC.accel;
+  const titleEl = $('modal-chart-title');
+  const subEl = $('modal-chart-sub');
+  if (titleEl) titleEl.textContent = `${EMOJI[rec.sport]} ${sportLabel(rec.sport)} — ${spec.title}`;
+  if (subEl) subEl.textContent = `${rec.name || 'Untitled session'} · ${new Date(rec.startedAt).toLocaleString()} · Drag along timeline to pan, scroll wheel or pinch to zoom`;
+
+  if (modalChart) {
+    modalChart.destroy();
+    modalChart = null;
+  }
+  if (modalRemoveControls) {
+    modalRemoveControls();
+    modalRemoveControls = null;
+  }
+
+  const canvas = $('modal-chart-canvas');
+  modalChart = createChart(canvas, kind, { radiusM: rec.settings.radiusM, isModal: true });
+  const totalSec = (rec.activeDurationMs || 0) / 1000;
+  const modalMaxPoints = Math.min(5000, Math.max(CONFIG.charts.reportMaxPoints, rec.samples.length));
+  const rows = downsampleRows(rec.samples, modalMaxPoints);
+  setReport(modalChart, rows, rec.swings, totalSec);
+
+  modalRemoveControls = attachInteractiveControls(modalChart, canvas, updateModalRangeLabel);
+  updateModalRangeLabel();
+
+  dialog.showModal();
+  $('btn-zoom-reset')?.focus();
+}
+
+function closeExpandedChart() {
+  const dialog = $('chart-modal');
+  if (dialog && dialog.open) dialog.close();
+  if (modalRemoveControls) {
+    modalRemoveControls();
+    modalRemoveControls = null;
+  }
+  if (modalChart) {
+    modalChart.destroy();
+    modalChart = null;
+  }
+  modalActiveRec = null;
 }
 
 async function removeSession(rec, fromReport) {
@@ -531,6 +687,7 @@ async function renderHistory(token) {
           <span>Swings <b>${s.metrics.totalSwings}</b></span>
           <span>Avg speed <b>${fmt(s.metrics.avgSpeedKmh)}</b> km/h</span>
           <span>Max speed <b>${fmt(s.metrics.maxSpeedKmh)}</b> km/h</span>
+          <span>Equipment <b>${s.equipment ? `${s.equipment.lengthInches}" · ${s.equipment.weightGrams}g` : '—'}</b></span>
           <span>Consistency <b>${s.metrics.consistency.score === null ? 'n/a' : s.metrics.consistency.score}</b></span>
         </div>
       </div>
@@ -599,7 +756,10 @@ function route() {
   currentView = name;
   for (const v of VIEWS) $(`view-${v}`).hidden = v !== name;
   document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active', a.dataset.nav === name));
-  if (name !== 'report') destroyReportCharts();
+  if (name !== 'report') {
+    destroyReportCharts();
+    closeExpandedChart();
+  }
   if (!(active && active.mode === 'live') && live.wantOpen && name !== 'setup' && name !== 'home') live.disconnect();
   updateChrome();
   window.scrollTo(0, 0);
@@ -631,12 +791,12 @@ function init() {
     settings.host = hp.host;
     settings.port = hp.port;
     saveSettings();
-    live.connect(hp.host, hp.port);
+    live.connect(hp.host, hp.port, true);
   });
   $('home-start').addEventListener('click', () => { location.hash = '#setup'; });
   $('home-check').addEventListener('click', () => {
     if (settings.mode === 'demo') toast('Demo Mode is selected, so the ESP8266 is not used. Switch to Live Hardware Mode in New Session to connect.', 'warn');
-    live.connect(settings.host, settings.port);
+    live.connect(settings.host, settings.port, true);
   });
   $('btn-start').addEventListener('click', () => startSession());
   $('btn-pause').addEventListener('click', pauseSession);
@@ -647,6 +807,28 @@ function init() {
   $('hist-import').addEventListener('click', () => $('import-file').click());
   $('import-file').addEventListener('change', onImportFile);
   $('hist-export-all').addEventListener('click', exportAll);
+
+  // Modal zoom and pan controls
+  $('btn-zoom-in')?.addEventListener('click', () => { if (modalChart) { zoomChart(modalChart, 0.7); updateModalRangeLabel(); } });
+  $('btn-zoom-out')?.addEventListener('click', () => { if (modalChart) { zoomChart(modalChart, 1.4); updateModalRangeLabel(); } });
+  $('btn-pan-left')?.addEventListener('click', () => { if (modalChart) { panChart(modalChart, -0.25); updateModalRangeLabel(); } });
+  $('btn-pan-right')?.addEventListener('click', () => { if (modalChart) { panChart(modalChart, 0.25); updateModalRangeLabel(); } });
+  $('btn-zoom-reset')?.addEventListener('click', () => { if (modalChart) { resetChartZoom(modalChart); updateModalRangeLabel(); } });
+  $('btn-modal-close')?.addEventListener('click', closeExpandedChart);
+
+  let backdropDown = false;
+  $('chart-modal')?.addEventListener('pointerdown', (e) => {
+    backdropDown = (e.target === $('chart-modal'));
+  });
+  $('chart-modal')?.addEventListener('click', (e) => {
+    if (e.target === $('chart-modal') && backdropDown) {
+      closeExpandedChart();
+    }
+  });
+  $('chart-modal')?.addEventListener('close', () => {
+    closeExpandedChart();
+  });
+
   window.addEventListener('hashchange', route);
   window.addEventListener('beforeunload', (e) => { if (active) { e.preventDefault(); e.returnValue = ''; } });
   if (!window.Chart) banner('Chart.js failed to load. Start the app with "npm start" and open the printed address (do not open index.html directly).');

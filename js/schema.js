@@ -58,6 +58,18 @@ export function validateSessionRecord(obj) {
   const cleanSwing = {};
   for (const [k, v] of Object.entries(swingSettings)) if (isNum(v)) cleanSwing[k] = v;
 
+  let cleanEquipment = null;
+  if (obj.equipment && typeof obj.equipment === 'object') {
+    const { lengthInches, weightGrams, sensorMount } = obj.equipment;
+    if (isNum(lengthInches) && lengthInches > 0 && isNum(weightGrams) && weightGrams > 0) {
+      cleanEquipment = {
+        lengthInches: Math.round(lengthInches * 10) / 10,
+        weightGrams: Math.round(weightGrams),
+        sensorMount: typeof sensorMount === 'string' ? sensorMount.slice(0, 30) : 'below_grip',
+      };
+    }
+  }
+
   return {
     ok: true,
     record: {
@@ -73,6 +85,7 @@ export function validateSessionRecord(obj) {
       storedStride: isNum(obj.storedStride) && obj.storedStride >= 1 ? obj.storedStride : 1,
       invalidSamples: isNum(obj.invalidSamples) ? obj.invalidSamples : 0,
       timeGaps: isNum(obj.timeGaps) ? obj.timeGaps : 0,
+      equipment: cleanEquipment,
       settings: { radiusM: isNum(obj.settings?.radiusM) ? obj.settings.radiusM : CONFIG.sports[obj.sport].radiusM, swing: cleanSwing },
       metrics,
       swings,

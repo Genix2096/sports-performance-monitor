@@ -9,7 +9,7 @@
  * are likewise re-anchored instead of inflating the duration.
  */
 import { CONFIG } from './config.js';
-import { SwingDetector, magnitude, normalizeSample, estimateSwingSpeed, consistencyScore } from './analytics.js';
+import { SwingDetector, magnitude, normalizeSample, estimateSwingSpeed, consistencyScore, validateEquipment, calculateEffectiveRadius } from './analytics.js';
 
 export const SCHEMA_VERSION = 1;
 
@@ -24,7 +24,7 @@ export function makeId() {
 const r3 = (v) => Math.round(v * 1000) / 1000;
 
 export class Session {
-  constructor({ id = makeId(), sport, name = '', mode, nominalMs, now = () => Date.now() } = {}) {
+  constructor({ id = makeId(), sport, name = '', mode, nominalMs, equipment = null, now = () => Date.now() } = {}) {
     if (!CONFIG.sports[sport]) throw new Error(`Unknown sport: ${sport}`);
     this.id = id;
     this.sport = sport;
@@ -33,7 +33,22 @@ export class Session {
     this.now = now;
     this.state = 'ready'; // ready | running | paused | stopped
     this.nominalMs = nominalMs || 1000 / (CONFIG.sampleRateHz[mode] || 50);
-    this.radiusM = CONFIG.sports[sport].radiusM;
+
+    // Equipment configuration snapshot and effective radius
+    if (equipment && typeof equipment === 'object') {
+      const v = validateEquipment(sport, equipment);
+      if (v.valid) {
+        this.equipment = { lengthInches: v.lengthInches, weightGrams: v.weightGrams, sensorMount: 'below_grip' };
+        this.radiusM = calculateEffectiveRadius(sport, v.lengthInches);
+      } else {
+        this.equipment = null;
+        this.radiusM = CONFIG.sports[sport].radiusM;
+      }
+    } else {
+      this.equipment = null;
+      this.radiusM = CONFIG.sports[sport].radiusM;
+    }
+
     this.params = { ...CONFIG.sports[sport].swing };
     this.detector = new SwingDetector(this.params);
     this.rows = []; // [t, ax, ay, az, gx, gy, gz] (stored, possibly decimated)
@@ -52,6 +67,11 @@ export class Session {
     this._sumAccel = 0;
     this.maxGyro = 0;
     this.maxAccel = 0;
+  }
+
+  triggerRebase() {
+    this._rebase = true;
+    if (this.detector) this.detector.reset();
   }
 
   start() {
@@ -174,6 +194,7 @@ export class Session {
       storedStride: this.stride,
       invalidSamples: this.invalidCount,
       timeGaps: this.gapCount,
+      equipment: this.equipment ? { ...this.equipment } : null,
       settings: { radiusM: this.radiusM, swing: { ...this.params } },
       metrics: this.metrics(),
       swings: this.swings.map((s) => ({ ...s })),
