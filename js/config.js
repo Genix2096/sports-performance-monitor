@@ -38,6 +38,47 @@ export const CONFIG = {
   sensorLimits: { maxG: 32, maxDps: 4000 },
 
   /**
+   * Webcam recording (browser MediaRecorder). The video stays in browser memory only — it is never
+   * sent to the ESP8266, the Node server or any cloud service. See README "Video, sync & pose".
+   *  maxDurationS / maxBytes  recording is stopped automatically above either limit (memory safety)
+   *  maxInMemory              most recent recordings kept in this tab; older ones are released
+   *  defaultPreS / defaultPostS  replay padding around a swing peak (seconds)
+   */
+  video: {
+    idealWidth: 1280,
+    idealHeight: 720,
+    frameRate: 30,
+    videoBitsPerSecond: 2500000, // ~19 MB per minute
+    timesliceMs: 1000,
+    maxDurationS: 20 * 60,
+    maxBytes: 800 * 1024 * 1024,
+    maxInMemory: 3,
+    defaultPreS: 1.5,
+    defaultPostS: 1.5,
+    maxPadS: 10,
+  },
+
+  /**
+   * Pose estimation (MediaPipe Pose Landmarker "lite", runs locally via WebAssembly).
+   * Model and runtime are served by the local Node server (npm run fetch-model downloads the model once).
+   */
+  pose: {
+    bundleUrl: '../vendor/mediapipe/vision_bundle.mjs', // relative to js/pose.js
+    wasmBase: '../vendor/mediapipe/wasm',
+    modelUrl: '../models/pose_landmarker_lite.task',
+    liveFps: 10, // max live inference rate; lowered automatically if inference is slow
+    minVisibility: 0.5, // landmarks below this visibility are not used for indicators
+    lowLightLuma: 45, // mean frame luma (0-255) below which a low-light warning is shown
+    associateToleranceMs: 150, // max distance between a swing peak and a live pose frame
+  },
+
+  /** Sensor-to-browser clock mapping (see js/sync.js). */
+  sync: {
+    clockWindowMs: 3000, // lower-envelope window for the sensor->browser clock offset
+    edgeToleranceMs: 100,
+  },
+
+  /**
    * Swing detector parameters (see js/analytics.js SwingDetector).
    *  startDps       gyro magnitude that begins a candidate swing
    *  endDps         gyro magnitude below which the swing ends (hysteresis / re-arming level)

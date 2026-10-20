@@ -63,6 +63,9 @@ export class Session {
     this._prevTs = null;
     this._offset = 0;
     this._rebase = false;
+    // Incremented whenever the time base is re-anchored (resume, reconnect, gap, reboot). Used by
+    // js/sync.js: the sensor->browser clock offset is only assumed constant within one segment.
+    this.segment = 0;
     this._sumGyro = 0;
     this._sumAccel = 0;
     this.maxGyro = 0;
@@ -124,6 +127,7 @@ export class Session {
         if (jumped && !this._rebase) this.gapCount++;
         this._offset = this.lastT + this.nominalMs - s.ts;
         this.detector.reset();
+        this.segment++;
       }
     }
     this._rebase = false;
@@ -155,7 +159,7 @@ export class Session {
       swing = { t: ev.t, durationMs: ev.durationMs, peakDps: r3(ev.peakDps), peakG: r3(ev.peakG), speedMs: r3(sp.ms), speedKmh: r3(sp.kmh) };
       this.swings.push(swing);
     }
-    return { accepted: true, row, swing };
+    return { accepted: true, row, swing, segment: this.segment };
   }
 
   metrics() {

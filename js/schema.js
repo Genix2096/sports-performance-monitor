@@ -42,7 +42,10 @@ export function validateSessionRecord(obj) {
   const swings = [];
   for (const s of obj.swings) {
     if (!s || !['t', 'durationMs', 'peakDps', 'peakG', 'speedMs', 'speedKmh'].every((k) => isNum(s[k]))) return fail('Invalid swing entry');
-    swings.push({ t: s.t, durationMs: s.durationMs, peakDps: s.peakDps, peakG: s.peakG, speedMs: s.speedMs, speedKmh: s.speedKmh });
+    const entry = { t: s.t, durationMs: s.durationMs, peakDps: s.peakDps, peakG: s.peakG, speedMs: s.speedMs, speedKmh: s.speedKmh };
+    if (isNum(s.videoS)) entry.videoS = s.videoS;
+    if (s.pose && typeof s.pose === 'object') entry.pose = s.pose;
+    swings.push(entry);
   }
 
   if (!Array.isArray(obj.samples)) return fail('samples must be an array');
@@ -70,6 +73,27 @@ export function validateSessionRecord(obj) {
     }
   }
 
+  let cleanVideo = null;
+  if (obj.video && typeof obj.video === 'object') {
+    cleanVideo = {
+      recorded: !!obj.video.recorded,
+      durationS: isNum(obj.video.durationS) ? obj.video.durationS : 0,
+      mimeType: typeof obj.video.mimeType === 'string' ? obj.video.mimeType.slice(0, 50) : '',
+      sizeBytes: isNum(obj.video.sizeBytes) ? obj.video.sizeBytes : 0,
+      source: typeof obj.video.source === 'string' ? obj.video.source.slice(0, 30) : 'webcam',
+      calibrationOffsetMs: isNum(obj.video.calibrationOffsetMs) ? obj.video.calibrationOffsetMs : 0,
+      uncertaintyMs: isNum(obj.video.uncertaintyMs) ? obj.video.uncertaintyMs : null,
+      timeline: obj.video.timeline && typeof obj.video.timeline === 'object' ? obj.video.timeline : null,
+    };
+  }
+
+  let cleanSync = null;
+  if (obj.sync && typeof obj.sync === 'object') {
+    cleanSync = {
+      clock: obj.sync.clock && typeof obj.sync.clock === 'object' ? obj.sync.clock : null,
+    };
+  }
+
   return {
     ok: true,
     record: {
@@ -86,6 +110,8 @@ export function validateSessionRecord(obj) {
       invalidSamples: isNum(obj.invalidSamples) ? obj.invalidSamples : 0,
       timeGaps: isNum(obj.timeGaps) ? obj.timeGaps : 0,
       equipment: cleanEquipment,
+      video: cleanVideo,
+      sync: cleanSync,
       settings: { radiusM: isNum(obj.settings?.radiusM) ? obj.settings.radiusM : CONFIG.sports[obj.sport].radiusM, swing: cleanSwing },
       metrics,
       swings,

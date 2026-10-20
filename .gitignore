@@ -4,3 +4,8 @@ node_modules/
 !.env.example
 dist/
 coverage/
+# pose model is downloaded locally with `npm run fetch-model`
+models/*.task
+# never commit recorded session videos
+*.webm
+*.mp4

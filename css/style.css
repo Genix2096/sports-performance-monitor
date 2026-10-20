@@ -246,6 +246,105 @@ dialog h2 { margin-bottom: 8px; font-size: 1.15rem; }
 .toast.bad { border-left-color: var(--red); }
 .toast.warn { border-left-color: var(--amber); }
 
+/* ---------------- Webcam & Pose Styles ---------------- */
+.select-input {
+  background: #0d1530; border: 1px solid var(--line); color: var(--text); border-radius: 10px; padding: 10px 12px; font: inherit;
+}
+.select-sm { padding: 6px 10px; font-size: 13px; border-radius: 8px; }
+.checkbox-label { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 14px; }
+.checkbox-label input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); }
+
+.cam-card-header, .timeline-card-header {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px;
+}
+.cam-badges { display: flex; gap: 8px; flex-wrap: wrap; }
+.cam-layout { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(280px, 1fr); gap: 16px; }
+
+.cam-preview-wrap {
+  position: relative; aspect-ratio: 16 / 9; min-height: 240px; background: #070d1e;
+  border: 1px solid var(--line); border-radius: 12px; overflow: hidden; display: flex; align-items: center; justify-content: center;
+}
+.cam-preview-wrap.recording {
+  border-color: var(--red); box-shadow: 0 0 16px rgba(248, 113, 113, 0.25);
+}
+#live-webcam-video { width: 100%; height: 100%; object-fit: contain; display: block; }
+#live-pose-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+
+.cam-placeholder {
+  position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  background: rgba(11, 16, 32, 0.94); z-index: 2; padding: 16px; text-align: center;
+}
+.cam-sidebar { display: flex; flex-direction: column; gap: 12px; justify-content: space-between; }
+.cam-toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.pose-indicators-card {
+  background: var(--card2); border: 1px solid var(--line); border-radius: 10px; padding: 12px;
+}
+.indicators-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.grid-indicators { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
+.ind-item {
+  background: var(--bg2); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+  display: flex; justify-content: space-between; align-items: center; font-size: 13px;
+}
+.ind-l { color: var(--muted); font-size: 11.5px; }
+.ind-item b { font-variant-numeric: tabular-nums; color: var(--text); }
+
+/* ---------------- Swing Timeline & Synchronized Replay ---------------- */
+.sync-controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.pad-control { font-size: 13px; color: var(--muted); display: inline-flex; align-items: center; gap: 4px; }
+.input-xs { width: 50px; padding: 4px 6px; font-size: 13px; border-radius: 6px; }
+
+.swing-timeline-bar {
+  position: relative; height: 38px; background: var(--card2); border: 1px solid var(--line);
+  border-radius: 8px; margin: 10px 0; cursor: pointer; user-select: none; overflow: hidden;
+}
+.swing-timeline-track { position: absolute; inset: 0; }
+.swing-timeline-playhead {
+  position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent);
+  box-shadow: 0 0 8px var(--accent); pointer-events: none; transform: translateX(-50%);
+}
+.timeline-swing-marker {
+  position: absolute; top: 4px; bottom: 4px; width: 6px; border-radius: 3px;
+  background: var(--pink); transform: translateX(-50%); cursor: pointer; transition: transform 0.12s;
+}
+.timeline-swing-marker:hover, .timeline-swing-marker.active {
+  transform: translateX(-50%) scale(1.4); background: #fbcfe8; z-index: 2;
+}
+
+.swing-chips {
+  display: flex; gap: 8px; overflow-x: auto; padding: 4px 0 8px; margin: 6px 0;
+}
+.swing-chip {
+  background: var(--card2); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px;
+  font-size: 13px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  color: var(--text); transition: border-color .15s, background .15s;
+}
+.swing-chip:hover { border-color: #3b82f6; }
+.swing-chip.active { border-color: var(--accent); background: rgba(52, 211, 153, 0.15); }
+.swing-chip .chip-speed { color: var(--accent); font-weight: 700; }
+
+.swing-replay-wrap {
+  margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line);
+}
+.replay-player-row {
+  display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(280px, 1fr); gap: 16px; align-items: start;
+}
+.replay-video-box {
+  position: relative; aspect-ratio: 16 / 9; background: #070d1e; border: 1px solid var(--line);
+  border-radius: 10px; overflow: hidden;
+}
+#replay-video, #rep-replay-video { width: 100%; height: 100%; object-fit: contain; display: block; }
+#replay-pose-canvas, #rep-replay-pose-canvas {
+  position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none;
+}
+.replay-info-box {
+  background: var(--card2); border: 1px solid var(--line); border-radius: 10px; padding: 14px;
+}
+.calibration-row input[type="range"] {
+  width: 100%; accent-color: var(--blue); margin-top: 4px;
+}
+
+
 @media (max-width: 1000px) {
   .g-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .g3 { grid-template-columns: minmax(0, 1fr); }
@@ -258,6 +357,7 @@ dialog h2 { margin-bottom: 8px; font-size: 1.15rem; }
   .top-badges { margin-left: auto; }
   .hitem { grid-template-columns: auto 1fr; }
   .hactions { grid-column: 1 / -1; justify-content: flex-start; }
+  .cam-layout, .replay-player-row { grid-template-columns: 1fr; }
   .chart-wrap { height: 230px; }
   .hero { padding: 18px; }
   .controls .btn { flex: 1 1 140px; }

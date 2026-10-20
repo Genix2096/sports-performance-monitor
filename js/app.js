@@ -10,6 +10,10 @@ import { magnitude, fmt, formatDuration, downsampleRows, buildSummaryText, valid
 import { saveSession, listSessions, getSession, deleteSession, importRecords } from './storage.js';
 import { parseImportText, toExportBundle, toCsv } from './schema.js';
 import { createChart, updateLive, setReport, SPEC, zoomChart, panChart, resetChartZoom, attachInteractiveControls } from './charts.js';
+import { VideoRecorder, REC_STATE, createSyntheticCamera, cameraSupport } from './recorder.js';
+import { MediaStore } from './media-store.js';
+import { SensorClockMap, sensorTimeToVideo, videoToSensorTime, mapSwingsToVideo, sanitizePadding, replayWindow, estimateUncertainty } from './sync.js';
+import { PoseTracker, POSE_STATE, alignCanvasToVideo } from './pose.js';
 
 const $ = (id) => document.getElementById(id);
 const EMOJI = { cricket: '🏏', badminton: '🏸', tennis: '🎾' };
@@ -20,12 +24,21 @@ const sportLabel = (id) => CONFIG.sports[id]?.label || id;
 const SETTINGS_KEY = 'spm.settings.v1';
 const EQUIPMENT_KEY = 'spm.equipment.v1';
 
-const settings = { sport: 'cricket', mode: 'demo', name: '', host: CONFIG.esp.host, port: CONFIG.esp.port };
+const settings = {
+  sport: 'cricket',
+  mode: 'demo',
+  name: '',
+  host: CONFIG.esp.host,
+  port: CONFIG.esp.port,
+  cameraMode: 'webcam', // webcam | synthetic | none
+  poseEnabled: true,
+};
 try {
   Object.assign(settings, JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'));
 } catch { /* ignore corrupt settings */ }
 if (!SPORT_IDS.includes(settings.sport)) settings.sport = 'cricket';
 if (settings.mode !== 'demo' && settings.mode !== 'live') settings.mode = 'demo';
+if (!['webcam', 'synthetic', 'none'].includes(settings.cameraMode)) settings.cameraMode = 'webcam';
 function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch { /* storage may be blocked */ }
 }
@@ -62,6 +75,29 @@ let reportCharts = [];
 let modalChart = null;
 let modalRemoveControls = null;
 let modalActiveRec = null;
+
+// Video, Pose & Synchronization state
+const mediaStore = new MediaStore({
+  maxItems: CONFIG.video?.maxInMemory || 3,
+  onEvict: (entry) => toast(`Video for session ${entry.sessionId.slice(-6)} was released from memory to preserve browser RAM.`, 'warn'),
+});
+let recorder = null;
+let poseTracker = null;
+let clockMap = new SensorClockMap({ windowMs: CONFIG.sync?.clockWindowMs || 3000 });
+let syntheticCam = null;
+let sessionOriginPerf = 0;
+let calibrationOffsetMs = 0;
+let liveSwings = [];
+let activeLiveReplayIndex = -1;
+let liveReplayTimer = null;
+let poseLoopId = null;
+let poseLoopActive = false;
+let lastLivePose = null;
+let poseOverlayVisible = true;
+let replayPoseOverlayVisible = true;
+let activeReportRec = null;
+let activeReportSwingIdx = -1;
+let reportReplayTimer = null;
 
 const live = new LiveSensor({
   onState: () => { updateChrome(); refreshConnectionUi(); },
@@ -227,6 +263,17 @@ function renderSetup() {
   $('setup-host').value = settings.host;
   $('setup-port').value = settings.port;
   $('setup-error').hidden = true;
+
+  const camSelect = $('setup-camera-mode');
+  if (camSelect) camSelect.value = settings.cameraMode;
+  const poseCheck = $('setup-pose-enable');
+  if (poseCheck) poseCheck.checked = settings.poseEnabled;
+  const note = $('setup-cam-support-note');
+  if (note) {
+    const sup = cameraSupport();
+    note.textContent = sup.getUserMedia ? '✓ Camera access supported in this browser.' : `Notice: ${sup.reason}`;
+  }
+
   renderSetupLive();
 }
 
@@ -277,6 +324,11 @@ function startFromSetup(ev) {
   saveEquipmentStore();
 
   settings.name = $('setup-name').value.trim();
+  const camMode = $('setup-camera-mode')?.value || 'webcam';
+  const poseOn = $('setup-pose-enable') ? $('setup-pose-enable').checked : true;
+  settings.cameraMode = camMode;
+  settings.poseEnabled = poseOn;
+
   if (settings.mode === 'live') {
     const hp = readHostPort();
     if (hp.error) { err.textContent = hp.error; err.hidden = false; return; }
@@ -289,6 +341,58 @@ function startFromSetup(ev) {
 }
 
 /* ------------------------------ SESSION LIFECYCLE ------------------------------ */
+function ensureVideoAndPose() {
+  if (!recorder) {
+    recorder = new VideoRecorder({
+      video: CONFIG.video,
+      maxBytes: CONFIG.video?.maxBytes,
+      maxDurationS: CONFIG.video?.maxDurationS,
+      timesliceMs: CONFIG.video?.timesliceMs,
+      videoBitsPerSecond: CONFIG.video?.videoBitsPerSecond,
+      onChange: () => updateCameraUi(),
+    });
+  }
+  if (!poseTracker) {
+    poseTracker = new PoseTracker({ config: CONFIG.pose });
+  }
+
+  recorder.resetForSession();
+
+  const camMode = settings.cameraMode;
+  if (camMode === 'synthetic') {
+    if (syntheticCam) { syntheticCam.stop(); syntheticCam = null; }
+    syntheticCam = createSyntheticCamera({
+      getMotion: () => latest ? { t: latest[0], gyroMag: magnitude(latest[4], latest[5], latest[6]), accelMag: magnitude(latest[1], latest[2], latest[3]) } : null,
+    });
+    if (syntheticCam) {
+      recorder.attachStream(syntheticCam.stream, 'synthetic');
+      const v = $('live-webcam-video');
+      if (v) { v.srcObject = syntheticCam.stream; v.play().catch(() => {}); }
+      recorder.startRecording(sessionOriginPerf);
+    }
+  } else if (camMode === 'webcam') {
+    recorder.openCamera().then((ok) => {
+      if (ok && recorder.stream) {
+        const v = $('live-webcam-video');
+        if (v) { v.srcObject = recorder.stream; v.play().catch(() => {}); }
+        recorder.startRecording(sessionOriginPerf);
+      }
+      updateCameraUi();
+    });
+  } else {
+    recorder.closeCamera(true);
+  }
+
+  if (settings.poseEnabled) {
+    poseTracker.init().then((ok) => {
+      if (ok) startPoseLoop();
+      updateCameraUi();
+    });
+  } else {
+    stopPoseLoop();
+  }
+}
+
 function startSession(equipmentSnapshot = null) {
   if (active) { toast('A session is already running.', 'warn'); return false; }
   const eq = equipmentSnapshot || { ...equipmentStore[settings.sport] };
@@ -297,7 +401,18 @@ function startSession(equipmentSnapshot = null) {
   liveRows = [];
   latest = null;
   lastSwing = null;
+  liveSwings = [];
+  activeLiveReplayIndex = -1;
+  lastLivePose = null;
+  sessionOriginPerf = performance.now();
+  clockMap = new SensorClockMap({
+    windowMs: CONFIG.sync?.clockWindowMs || 3000,
+    toleranceMs: CONFIG.sync?.edgeToleranceMs || 100,
+  });
   banner('');
+
+  ensureVideoAndPose();
+
   if (active.mode === 'demo') {
     demoSource = new DemoSource(active.sport);
     demoSource.setSink(handleSample);
@@ -307,6 +422,8 @@ function startSession(equipmentSnapshot = null) {
   }
   updateChrome();
   updateControls();
+  updateCameraUi();
+  updateLiveSwingTimeline();
   scheduleRender();
   return true;
 }
@@ -318,21 +435,45 @@ function handleSample(raw) {
   latest = r.row;
   liveRows.push(r.row);
   if (liveRows.length > 1500) liveRows = liveRows.slice(-700);
-  if (r.swing) lastSwing = r.swing;
+
+  const sampleArrivalPerf = performance.now() - sessionOriginPerf;
+  clockMap.add(r.row[0], sampleArrivalPerf, r.segment);
+
+  if (r.swing) {
+    lastSwing = r.swing;
+    const vm = sensorTimeToVideo(r.swing.t, clockMap, recorder?.timeline, calibrationOffsetMs, sampleArrivalPerf);
+    r.swing.videoS = vm.videoS;
+    r.swing.pose = lastLivePose ? { ...lastLivePose } : null;
+    liveSwings.push(r.swing);
+    updateLiveSwingTimeline();
+  }
+
+  if (active && CONFIG.limits?.maxDurationSeconds && active.durationMs >= CONFIG.limits.maxDurationSeconds * 1000) {
+    toast('Maximum session duration reached; stopping session.', 'warn');
+    stopSession();
+    return;
+  }
+
   scheduleRender();
 }
 
 function pauseSession() {
   if (!active || !active.pause()) return;
   if (demoSource) demoSource.pause();
+  if (recorder && recorder.isRecording) recorder.pause();
+  stopPoseLoop();
   updateControls();
+  updateCameraUi();
   renderLive();
 }
 
 function resumeSession() {
   if (!active || !active.resume()) return;
   if (demoSource) demoSource.resume();
+  if (recorder && recorder.state === REC_STATE.PAUSED) recorder.resume();
+  if (settings.poseEnabled && poseTracker && poseTracker.state === POSE_STATE.READY) startPoseLoop();
   updateControls();
+  updateCameraUi();
   renderLive();
 }
 
@@ -341,6 +482,22 @@ async function stopSession() {
   stopping = true;
   const s = active;
   try {
+    stopPoseLoop();
+    stopReplayPose();
+    let videoResult = null;
+    if (recorder) {
+      videoResult = await recorder.stopAndRelease('session_stop');
+    }
+    if (syntheticCam) {
+      syntheticCam.stop();
+      syntheticCam = null;
+    }
+    const liveVideo = $('live-webcam-video');
+    if (liveVideo) {
+      liveVideo.pause();
+      liveVideo.srcObject = null;
+    }
+
     s.stop();
     if (demoSource) { demoSource.stop(); demoSource = null; }
     if (s.mode === 'live') live.disconnect();
@@ -348,12 +505,29 @@ async function stopSession() {
     liveRows = [];
     updateChrome();
     updateControls();
+    updateCameraUi();
+
     const rec = s.toRecord();
     if (rec.metrics.sampleCount === 0) {
       toast('Session was empty (no sensor data received), so nothing was saved.', 'warn');
       renderLive();
       return;
     }
+
+    // Attach video & sync metadata if recording occurred
+    if (videoResult && videoResult.blob) {
+      mediaStore.put(rec.id, videoResult.blob, videoResult.info);
+      rec.video = { ...videoResult.info, calibrationOffsetMs };
+      rec.sync = { clock: clockMap.toJSON() };
+      // Map all swings to video using the complete recording timeline
+      const mapped = mapSwingsToVideo(rec.swings, clockMap, recorder.timeline, calibrationOffsetMs);
+      rec.swings = rec.swings.map((sw, idx) => ({
+        ...sw,
+        videoS: mapped[idx].videoS,
+        syncStatus: mapped[idx].status,
+      }));
+    }
+
     try {
       await saveSession(rec);
       toast('Session saved.');
@@ -371,6 +545,475 @@ function resetSimulator() {
   if (!active || active.mode !== 'demo' || !demoSource) return;
   demoSource.reset(active.sport);
   toast('Simulator restarted (new simulated motion pattern).');
+}
+
+/* ------------------------------ CAMERA & POSE UI HELPERS ------------------------------ */
+function updateCameraUi() {
+  const badgeCam = $('badge-cam-state');
+  const badgePose = $('badge-pose-state');
+  const badgeSize = $('badge-video-size');
+  const placeholder = $('cam-placeholder');
+  const btnToggle = $('btn-cam-toggle');
+
+  if (!recorder) return;
+  const st = recorder.state;
+  if (badgeCam) {
+    if (st === REC_STATE.RECORDING) {
+      badgeCam.textContent = '● Video: Recording';
+      badgeCam.className = 'badge badge-bad';
+    } else if (st === REC_STATE.PAUSED) {
+      badgeCam.textContent = '⏸ Video: Paused';
+      badgeCam.className = 'badge badge-warn';
+    } else if (st === REC_STATE.PREVIEW) {
+      badgeCam.textContent = 'Camera: Preview';
+      badgeCam.className = 'badge badge-ok';
+    } else if (st === REC_STATE.ERROR) {
+      badgeCam.textContent = 'Camera: Error';
+      badgeCam.className = 'badge badge-bad';
+    } else {
+      badgeCam.textContent = 'Camera: Off';
+      badgeCam.className = 'badge badge-off';
+    }
+  }
+
+  if (badgePose) {
+    const pst = poseTracker ? poseTracker.state : POSE_STATE.UNINITIALIZED;
+    if (pst === POSE_STATE.READY) {
+      badgePose.textContent = poseLoopActive ? 'Pose: Active' : 'Pose: Ready';
+      badgePose.className = 'badge badge-ok';
+    } else if (pst === POSE_STATE.LOADING) {
+      badgePose.textContent = 'Pose: Loading…';
+      badgePose.className = 'badge badge-warn';
+    } else if (pst === POSE_STATE.ERROR) {
+      badgePose.textContent = 'Pose: Unavailable';
+      badgePose.className = 'badge badge-bad';
+    } else {
+      badgePose.textContent = 'Pose: Off';
+      badgePose.className = 'badge badge-off';
+    }
+  }
+
+  if (badgeSize) {
+    if (recorder.bytes > 0) {
+      badgeSize.hidden = false;
+      const mb = (recorder.bytes / 1048576).toFixed(1);
+      badgeSize.textContent = `${mb} MB (RAM)`;
+    } else {
+      badgeSize.hidden = true;
+    }
+  }
+
+  if (placeholder) {
+    placeholder.hidden = recorder.hasStream;
+  }
+
+  if (btnToggle) {
+    btnToggle.textContent = recorder.hasStream ? 'Disable Camera' : 'Enable Camera';
+  }
+
+  const warnBox = $('cam-warning-box');
+  if (warnBox) {
+    const err = recorder.error?.message || recorder.warning || (poseTracker?.state === POSE_STATE.ERROR ? poseTracker.errorMsg : '');
+    if (err) {
+      warnBox.textContent = err;
+      warnBox.hidden = false;
+    } else if (poseTracker?.isLowLight) {
+      warnBox.textContent = 'Notice: Low lighting detected in camera view. Pose tracking accuracy may be reduced.';
+      warnBox.hidden = false;
+    } else {
+      warnBox.hidden = true;
+    }
+  }
+}
+
+function startPoseLoop() {
+  if (poseLoopActive) return;
+  poseLoopActive = true;
+  updateCameraUi();
+
+  const video = $('live-webcam-video');
+  const canvas = $('live-pose-canvas');
+  if (!video || !canvas || !poseTracker) return;
+  const ctx = canvas.getContext('2d');
+
+  let lastInference = 0;
+  const targetInterval = 1000 / (CONFIG.pose?.liveFps || 10);
+
+  const loop = () => {
+    if (!poseLoopActive) return;
+    const now = performance.now();
+    if (now - lastInference >= targetInterval && video.readyState >= 2) {
+      lastInference = now;
+      alignCanvasToVideo(video, canvas);
+
+      const res = poseTracker.processFrame(video, now - sessionOriginPerf);
+      if (res && res.detected && res.landmarks) {
+        lastLivePose = res.indicators;
+        if (poseOverlayVisible) {
+          poseTracker.drawOverlay(ctx, res.landmarks, canvas.width, canvas.height);
+        } else {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+        updatePoseIndicatorsDisplay(res.indicators);
+      } else {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        if (res && !res.detected) {
+          updatePoseIndicatorsDisplay(null);
+        }
+      }
+      updateCameraUi();
+    }
+    poseLoopId = requestAnimationFrame(loop);
+  };
+  poseLoopId = requestAnimationFrame(loop);
+}
+
+function stopPoseLoop() {
+  poseLoopActive = false;
+  if (poseLoopId) {
+    cancelAnimationFrame(poseLoopId);
+    poseLoopId = null;
+  }
+  const canvas = $('live-pose-canvas');
+  if (canvas) {
+    const ctx = canvas.getContext('2d');
+    ctx?.clearRect(0, 0, canvas.width, canvas.height);
+  }
+  updateCameraUi();
+}
+
+function updatePoseIndicatorsDisplay(ind) {
+  const confBadge = $('pose-conf-badge');
+  const fmtAngle = (deg) => deg !== null && Number.isFinite(deg) ? `${deg.toFixed(0)}°` : '—';
+
+  if (!ind || !ind.available || !ind.indicators) {
+    $('ind-le').textContent = '—';
+    $('ind-re').textContent = '—';
+    $('ind-torso').textContent = '—';
+    $('ind-lk').textContent = '—';
+    $('ind-rk').textContent = '—';
+    $('ind-st').textContent = '—';
+    if (confBadge) {
+      confBadge.textContent = 'Confidence: low/occluded';
+      confBadge.className = 'badge badge-warn';
+    }
+    return;
+  }
+
+  const i = ind.indicators;
+  $('ind-le').textContent = fmtAngle(i.leftElbowDeg);
+  $('ind-re').textContent = fmtAngle(i.rightElbowDeg);
+  $('ind-torso').textContent = fmtAngle(i.torsoInclinationDeg);
+  $('ind-lk').textContent = fmtAngle(i.leftKneeDeg);
+  $('ind-rk').textContent = fmtAngle(i.rightKneeDeg);
+  $('ind-st').textContent = fmtAngle(i.shoulderTiltDeg);
+
+  if (confBadge) {
+    const pct = Math.round(ind.overallConfidence * 100);
+    confBadge.textContent = `Confidence: ${pct}%`;
+    confBadge.className = `badge ${pct >= 70 ? 'badge-ok' : pct >= 40 ? 'badge-warn' : 'badge-bad'}`;
+  }
+}
+
+/* ------------------------------ REPLAY POSE OVERLAY ------------------------------ */
+function renderReplayPoseFrame(video, canvas, onIndicators = null) {
+  if (!video || !canvas || video.readyState < 2) return;
+  alignCanvasToVideo(video, canvas);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  if (!replayPoseOverlayVisible) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+
+  if (!poseTracker) {
+    poseTracker = new PoseTracker({ config: CONFIG.pose });
+  }
+
+  if (poseTracker.state === POSE_STATE.READY) {
+    const res = poseTracker.processFrame(video, performance.now());
+    if (res && res.detected && res.landmarks) {
+      poseTracker.drawOverlay(ctx, res.landmarks, canvas.width, canvas.height);
+      if (onIndicators) onIndicators(res.indicators);
+    } else {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (onIndicators) onIndicators(null);
+    }
+  } else if (poseTracker.state === POSE_STATE.UNINITIALIZED) {
+    poseTracker.init().then((ok) => {
+      if (ok && video.readyState >= 2) {
+        renderReplayPoseFrame(video, canvas, onIndicators);
+      }
+    });
+  }
+}
+
+function attachReplayPoseLoop(video, canvas, onIndicators = null) {
+  if (!video || !canvas) return () => {};
+
+  let frameCbId = null;
+  let isDestroyed = false;
+
+  const cancelCb = () => {
+    if (frameCbId !== null) {
+      if ('cancelVideoFrameCallback' in video) {
+        try { video.cancelVideoFrameCallback(frameCbId); } catch {}
+      } else {
+        try { cancelAnimationFrame(frameCbId); } catch {}
+      }
+      frameCbId = null;
+    }
+  };
+
+  const onNextFrame = () => {
+    if (isDestroyed) return;
+    renderReplayPoseFrame(video, canvas, onIndicators);
+    if (!video.paused && !video.ended) {
+      if ('requestVideoFrameCallback' in video) {
+        frameCbId = video.requestVideoFrameCallback(onNextFrame);
+      } else {
+        frameCbId = requestAnimationFrame(onNextFrame);
+      }
+    }
+  };
+
+  const onPlay = () => {
+    cancelCb();
+    if ('requestVideoFrameCallback' in video) {
+      frameCbId = video.requestVideoFrameCallback(onNextFrame);
+    } else {
+      frameCbId = requestAnimationFrame(onNextFrame);
+    }
+  };
+
+  const onPauseOrSeek = () => {
+    cancelCb();
+    renderReplayPoseFrame(video, canvas, onIndicators);
+  };
+
+  const onResize = () => {
+    alignCanvasToVideo(video, canvas);
+    renderReplayPoseFrame(video, canvas, onIndicators);
+  };
+
+  video.addEventListener('play', onPlay);
+  video.addEventListener('pause', onPauseOrSeek);
+  video.addEventListener('seeked', onPauseOrSeek);
+  video.addEventListener('timeupdate', onPauseOrSeek);
+  video.addEventListener('loadeddata', onPauseOrSeek);
+  window.addEventListener('resize', onResize);
+
+  if (video.readyState >= 2) {
+    alignCanvasToVideo(video, canvas);
+    renderReplayPoseFrame(video, canvas, onIndicators);
+  }
+
+  return () => {
+    isDestroyed = true;
+    cancelCb();
+    video.removeEventListener('play', onPlay);
+    video.removeEventListener('pause', onPauseOrSeek);
+    video.removeEventListener('seeked', onPauseOrSeek);
+    video.removeEventListener('timeupdate', onPauseOrSeek);
+    video.removeEventListener('loadeddata', onPauseOrSeek);
+    window.removeEventListener('resize', onResize);
+    const ctx = canvas.getContext('2d');
+    ctx?.clearRect(0, 0, canvas.width, canvas.height);
+  };
+}
+
+function ensureReplayPose(video, canvas, onIndicators) {
+  if (!video || !canvas) return;
+  if (video._replayPoseCleanup) {
+    alignCanvasToVideo(video, canvas);
+    renderReplayPoseFrame(video, canvas, onIndicators);
+    return;
+  }
+  if (!poseTracker) {
+    poseTracker = new PoseTracker({ config: CONFIG.pose });
+  }
+  if (poseTracker.state === POSE_STATE.UNINITIALIZED) {
+    poseTracker.init().then(() => {
+      if (video.readyState >= 2) {
+        alignCanvasToVideo(video, canvas);
+        renderReplayPoseFrame(video, canvas, onIndicators);
+      }
+    });
+  }
+  video._replayPoseCleanup = attachReplayPoseLoop(video, canvas, onIndicators);
+}
+
+function stopReplayPose(video = null) {
+  if (video && video._replayPoseCleanup) {
+    video._replayPoseCleanup();
+    video._replayPoseCleanup = null;
+  }
+  if (!video) {
+    const v1 = $('replay-video');
+    if (v1 && v1._replayPoseCleanup) {
+      v1._replayPoseCleanup();
+      v1._replayPoseCleanup = null;
+    }
+    const v2 = $('rep-replay-video');
+    if (v2 && v2._replayPoseCleanup) {
+      v2._replayPoseCleanup();
+      v2._replayPoseCleanup = null;
+    }
+  }
+}
+
+function updateReportPoseIndicators(ind) {
+  const confBadge = $('rep-pose-conf');
+  const fmtAngle = (deg) => deg !== null && Number.isFinite(deg) ? `${deg.toFixed(0)}°` : '—';
+  if (!ind || !ind.available || !ind.indicators) {
+    const elLe = $('rep-ind-le'); if (elLe) elLe.textContent = '—';
+    const elRe = $('rep-ind-re'); if (elRe) elRe.textContent = '—';
+    const elT = $('rep-ind-torso'); if (elT) elT.textContent = '—';
+    const elLk = $('rep-ind-lk'); if (elLk) elLk.textContent = '—';
+    const elRk = $('rep-ind-rk'); if (elRk) elRk.textContent = '—';
+    const elSt = $('rep-ind-st'); if (elSt) elSt.textContent = '—';
+    if (confBadge) {
+      confBadge.textContent = 'Confidence: low/occluded';
+      confBadge.className = 'badge badge-warn';
+    }
+    return;
+  }
+  const i = ind.indicators;
+  const elLe = $('rep-ind-le'); if (elLe) elLe.textContent = fmtAngle(i.leftElbowDeg);
+  const elRe = $('rep-ind-re'); if (elRe) elRe.textContent = fmtAngle(i.rightElbowDeg);
+  const elT = $('rep-ind-torso'); if (elT) elT.textContent = fmtAngle(i.torsoInclinationDeg);
+  const elLk = $('rep-ind-lk'); if (elLk) elLk.textContent = fmtAngle(i.leftKneeDeg);
+  const elRk = $('rep-ind-rk'); if (elRk) elRk.textContent = fmtAngle(i.rightKneeDeg);
+  const elSt = $('rep-ind-st'); if (elSt) elSt.textContent = fmtAngle(i.shoulderTiltDeg);
+  if (confBadge) {
+    const pct = Math.round((ind.overallConfidence || 0) * 100);
+    confBadge.textContent = `Confidence: ${pct}%`;
+    confBadge.className = `badge ${pct >= 70 ? 'badge-ok' : pct >= 40 ? 'badge-warn' : 'badge-bad'}`;
+  }
+}
+
+/* ------------------------------ SWING TIMELINE & REPLAY ------------------------------ */
+function updateLiveSwingTimeline() {
+  const chipsBox = $('swing-chips');
+  const track = $('swing-timeline-track');
+  if (!chipsBox || !track) return;
+
+  if (!liveSwings.length) {
+    chipsBox.innerHTML = '<span class="muted small">No swings detected yet. Swing the equipment to see synchronized events here.</span>';
+    track.innerHTML = '';
+    return;
+  }
+
+  const totalDuration = Math.max(1000, active ? active.durationMs : 1000);
+
+  // Markers on timeline
+  track.innerHTML = liveSwings.map((s, i) => {
+    const pct = Math.min(100, Math.max(0, (s.t / totalDuration) * 100));
+    return `<div class="timeline-swing-marker ${activeLiveReplayIndex === i ? 'active' : ''}" style="left: ${pct}%;" data-idx="${i}" title="Swing #${i + 1} at ${(s.t / 1000).toFixed(1)}s (${fmt(s.speedKmh)} km/h)"></div>`;
+  }).join('');
+
+  // Chips
+  chipsBox.innerHTML = liveSwings.map((s, i) => {
+    const activeClass = activeLiveReplayIndex === i ? 'active' : '';
+    const vTime = s.videoS !== null && s.videoS !== undefined ? `${s.videoS.toFixed(1)}s` : 'no video';
+    return `<button type="button" class="swing-chip ${activeClass}" data-idx="${i}">
+      <span>#${i + 1}</span>
+      <span class="chip-speed">${fmt(s.speedKmh)} km/h</span>
+      <small class="muted">t=${(s.t / 1000).toFixed(1)}s (📹 ${vTime})</small>
+    </button>`;
+  }).join('');
+}
+
+function selectLiveSwing(idx) {
+  if (idx < 0 || idx >= liveSwings.length) return;
+  activeLiveReplayIndex = idx;
+  updateLiveSwingTimeline();
+
+  const s = liveSwings[idx];
+  const wrap = $('swing-replay-wrap');
+  if (!wrap) return;
+  wrap.hidden = false;
+
+  $('replay-swing-title').textContent = `Swing #${idx + 1} Details & Replay`;
+  const statsBox = $('replay-stats');
+  if (statsBox) {
+    statsBox.innerHTML = `
+      <div class="stat"><span class="stat-l">Estimated Speed</span><span class="stat-v">${fmt(s.speedKmh)}</span><span class="stat-u">km/h</span></div>
+      <div class="stat"><span class="stat-l">Peak Rotation</span><span class="stat-v">${fmt(s.peakDps, 0)}</span><span class="stat-u">°/s</span></div>
+      <div class="stat"><span class="stat-l">Peak Accel</span><span class="stat-v">${fmt(s.peakG, 2)}</span><span class="stat-u">g</span></div>
+      <div class="stat"><span class="stat-l">Duration</span><span class="stat-v">${fmt(s.durationMs, 0)}</span><span class="stat-u">ms</span></div>
+    `;
+  }
+
+  // Synchronize interactive live graphs: center chart view around this swing
+  if (charts.accel && active) {
+    const windowMs = CONFIG.charts.windowSeconds * 1000;
+    const centerT = s.t;
+    const minS = Math.max(0, (centerT - windowMs / 2) / 1000);
+    const maxS = minS + CONFIG.charts.windowSeconds;
+    charts.accel.options.scales.x.min = minS;
+    charts.accel.options.scales.x.max = maxS;
+    charts.gyro.options.scales.x.min = minS;
+    charts.gyro.options.scales.x.max = maxS;
+    charts.accel.update('none');
+    charts.gyro.update('none');
+  }
+
+  // Replay video clip if recording or recorded
+  const video = $('replay-video');
+  const canvas = $('replay-pose-canvas');
+  if (!video) return;
+
+  if (s.pose && s.pose.indicators) {
+    updatePoseIndicatorsDisplay(s.pose);
+  }
+
+  if (canvas) {
+    ensureReplayPose(video, canvas, updatePoseIndicatorsDisplay);
+  }
+
+  const preS = Number($('sync-pad-pre')?.value) || 1.5;
+  const postS = Number($('sync-pad-post')?.value) || 1.5;
+
+  let streamOrBlobUrl = '';
+  if (mediaStore.has(active?.id)) {
+    streamOrBlobUrl = mediaStore.get(active.id).url;
+  }
+
+  // Recalculate video timestamp with current calibrationOffsetMs
+  const vm = sensorTimeToVideo(s.t, clockMap, recorder?.timeline, calibrationOffsetMs, active ? active.durationMs : null);
+  const targetVideoS = vm.videoS;
+
+  const calVal = $('cal-offset-val');
+  if (calVal) calVal.textContent = `${calibrationOffsetMs >= 0 ? '+' : ''}${calibrationOffsetMs} ms`;
+  const uncEl = $('sync-uncertainty-badge');
+  if (uncEl) {
+    const unc = estimateUncertainty({
+      jitterMs: clockMap.typicalJitterMs() || 5,
+      sampleIntervalMs: active ? active.nominalMs : 20,
+      fps: 30,
+      startUncertaintyMs: recorder?.startUncertaintyMs || 0,
+      calibrated: calibrationOffsetMs !== 0,
+    });
+    uncEl.textContent = `Uncertainty: ±${unc.plusMinusMs} ms`;
+    uncEl.title = unc.note;
+  }
+
+  if (targetVideoS !== null && streamOrBlobUrl) {
+    if (video.src !== streamOrBlobUrl) video.src = streamOrBlobUrl;
+    const win = replayWindow(targetVideoS, preS, postS, video.duration || Infinity);
+    if (win) {
+      video.currentTime = win.startS;
+      video.play().catch(() => {});
+      if (liveReplayTimer) clearTimeout(liveReplayTimer);
+      const playDurationMs = (win.endS - win.startS) * 1000;
+      liveReplayTimer = setTimeout(() => {
+        video.pause();
+        video.currentTime = targetVideoS;
+      }, playDurationMs);
+    }
+  }
 }
 
 /* ------------------------------ LIVE VIEW ------------------------------ */
@@ -492,11 +1135,88 @@ async function renderReport(id, token) {
     box.innerHTML = `<div class="card empty"><h1 id="report-title">Report not found</h1><p class="muted">${esc(storageError || 'This session does not exist (it may have been deleted).')}</p><a class="btn btn-ghost" href="#history">Open history</a> <a class="btn btn-ghost" href="#home">Dashboard</a></div>`;
     return;
   }
+  activeReportRec = rec;
   const m = rec.metrics;
   const c = m.consistency;
   const tile = (l, v, u = '') => `<div class="stat"><span class="stat-l">${l}</span><span class="stat-v">${v}</span><span class="stat-u">${u || '&nbsp;'}</span></div>`;
   const isUnsaved = unsaved.has(rec.id);
   const label = sportLabel(rec.sport);
+  const mediaEntry = mediaStore.get(rec.id);
+  const hasVideoInMemory = !!mediaEntry && !!mediaEntry.url;
+  const hadVideoRecorded = !!rec.video?.recorded;
+
+  let videoSectionHtml = '';
+  if (hasVideoInMemory) {
+    const ext = rec.video?.mimeType?.includes('mp4') ? 'mp4' : 'webm';
+    videoSectionHtml = `
+      <section class="card" style="margin-bottom: 16px;">
+        <div class="cam-card-header">
+          <div>
+            <h2 class="card-title" style="margin:0;">Synchronized Video &amp; Pose Replay</h2>
+            <p class="muted small">Replay recorded swings aligned with sensor graphs. Video is kept in browser memory only.</p>
+          </div>
+          <div class="actions">
+            <button id="rep-pose-toggle" class="btn btn-ghost btn-sm" type="button">Toggle Pose Overlay</button>
+            <button id="rep-dl-video" class="btn btn-primary btn-sm" type="button">Download Video (.${ext})</button>
+          </div>
+        </div>
+        <div class="replay-player-row">
+          <div class="replay-video-box">
+            <video id="rep-replay-video" playsinline controls src="${mediaEntry.url}"></video>
+            <canvas id="rep-replay-pose-canvas"></canvas>
+          </div>
+          <div class="replay-info-box">
+            <h3 id="rep-selected-title" style="font-size:1.05rem; margin-bottom: 8px;">Selected Swing Pose &amp; Timing</h3>
+            <div id="rep-pose-box" class="pose-indicators-card" style="margin-bottom: 10px;">
+              <div class="indicators-header">
+                <span class="stat-l">Pose Indicators at Peak</span>
+                <span id="rep-pose-conf" class="badge badge-off">Select a swing below</span>
+              </div>
+              <div class="grid-indicators">
+                <div class="ind-item"><span class="ind-l">Left Elbow</span><b id="rep-ind-le">—</b></div>
+                <div class="ind-item"><span class="ind-l">Right Elbow</span><b id="rep-ind-re">—</b></div>
+                <div class="ind-item"><span class="ind-l">Torso Lean</span><b id="rep-ind-torso">—</b></div>
+                <div class="ind-item"><span class="ind-l">Left Knee</span><b id="rep-ind-lk">—</b></div>
+                <div class="ind-item"><span class="ind-l">Right Knee</span><b id="rep-ind-rk">—</b></div>
+                <div class="ind-item"><span class="ind-l">Shoulder Tilt</span><b id="rep-ind-st">—</b></div>
+              </div>
+              <p class="muted" style="font-size: 11px; margin: 8px 0 0; line-height: 1.3;">
+                2D optical estimates (not 3D biomechanics or medical advice). Angles reflect camera-plane projection.
+              </p>
+            </div>
+            <div class="calibration-row">
+              <label class="field" style="width: 100%;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                  <span class="small"><b>Sync Calibration:</b> <b id="rep-cal-val">${(rec.video?.calibrationOffsetMs || 0) >= 0 ? '+' : ''}${rec.video?.calibrationOffsetMs || 0} ms</b></span>
+                  <span id="rep-unc-badge" class="muted small" title="Estimated bound based on 50 Hz sensor sampling and 30 fps video. Precision is an estimate unless measured against a reference.">Precision: ±${rec.video?.uncertaintyMs || 35} ms</span>
+                </div>
+                <input id="rep-cal-slider" type="range" min="-500" max="500" step="10" value="${rec.video?.calibrationOffsetMs || 0}" aria-label="Sync calibration offset in milliseconds">
+                <p class="muted small sync-help-text" style="font-size: 11px; margin: 4px 0 0; line-height: 1.35;">
+                  <strong>Offset direction:</strong> <b>+ms</b> shifts video playback later (if visual swing lags the sensor peak); <b>−ms</b> shifts earlier. <em>Precision</em> is an estimate based on sample/frame periods.
+                </p>
+              </label>
+            </div>
+          </div>
+        </div>
+        <p class="muted small" style="margin: 10px 0 0;">
+          Privacy: Videos are stored only in this browser tab's RAM and disappear when you refresh or close the tab. Click <strong>Download Video</strong> to save a permanent copy.
+        </p>
+      </section>
+    `;
+  } else if (hadVideoRecorded) {
+    videoSectionHtml = `
+      <section class="card" style="margin-bottom: 16px;">
+        <h2 class="card-title">Synchronized Video</h2>
+        <p class="notice notice-info">
+          Video was recorded for this session (${rec.video.durationS?.toFixed(1) || '—'} s). For privacy and browser memory safety, video is not stored in IndexedDB. If you downloaded the video previously, attach it to restore synchronized replay.
+        </p>
+        <div class="actions" style="margin-top: 10px;">
+          <button id="rep-attach-video-btn" class="btn btn-ghost btn-sm" type="button">Attach Downloaded Video File (.webm/.mp4)</button>
+        </div>
+      </section>
+    `;
+  }
+
   box.innerHTML = `
     <div class="report-head">
       <div>
@@ -521,6 +1241,9 @@ async function renderReport(id, token) {
       ${tile('Max acceleration', fmt(m.maxAccelG, 2), 'g (magnitude)')}
       ${tile('Swing consistency', c.score === null ? 'Insufficient data' : `${c.score}/100`, c.score === null ? 'needs ≥ 3 swings' : `${c.status} · peak ω CV ${(c.cv * 100).toFixed(0)}%`)}
     </div>
+
+    ${videoSectionHtml}
+
     <section class="card summary"><h2 class="card-title">Performance summary</h2><p style="margin:0">${esc(buildSummaryText(m, label, rec.mode, rec.equipment))}</p>
       <p class="muted small" style="margin:10px 0 0">Estimated swing speed = peak angular velocity × effective radius (${rec.settings.radiusM} m). Calculated from equipment dimensions and rotation geometry (sensor mounted below grip). It is an estimate of hitting-zone speed, NOT ball speed or impact force.${rec.storedStride > 1 ? ` Graph data was thinned (every ${rec.storedStride}th sample stored); statistics use all samples.` : ''}</p></section>
     <div class="grid g3">
@@ -547,7 +1270,20 @@ async function renderReport(id, token) {
       </section>
     </div>
     <section class="card"><h2 class="card-title">Detected swings</h2>
-      ${rec.swings.length ? `<div class="table-scroll"><table><thead><tr><th>#</th><th>Time (s)</th><th>Peak ω (°/s)</th><th>Peak |a| (g)</th><th>Duration (ms)</th><th>Est. speed (km/h)</th></tr></thead><tbody>${rec.swings.map((s, i) => `<tr><td>${i + 1}</td><td>${(s.t / 1000).toFixed(1)}</td><td>${s.peakDps.toFixed(0)}</td><td>${s.peakG.toFixed(2)}</td><td>${s.durationMs.toFixed(0)}</td><td>${s.speedKmh.toFixed(1)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted">No swings detected in this session.</p>'}
+      ${rec.swings.length ? `<div class="table-scroll"><table><thead><tr><th>#</th><th>Sensor Time (s)</th>${hadVideoRecorded || hasVideoInMemory ? '<th>Video (s)</th>' : ''}<th>Peak ω (°/s)</th><th>Peak |a| (g)</th><th>Duration (ms)</th><th>Est. speed (km/h)</th>${hasVideoInMemory ? '<th>Replay</th>' : ''}</tr></thead><tbody>${rec.swings.map((s, i) => {
+        const baseVideoS = s.videoS !== null && s.videoS !== undefined ? s.videoS : null;
+        const vText = baseVideoS !== null ? `${Math.max(0, baseVideoS + ((rec.video?.calibrationOffsetMs || 0) / 1000)).toFixed(2)}s` : '—';
+        return `<tr>
+          <td>${i + 1}</td>
+          <td>${(s.t / 1000).toFixed(2)}</td>
+          ${hadVideoRecorded || hasVideoInMemory ? `<td class="rep-video-cell" data-base-video-s="${baseVideoS !== null ? baseVideoS : ''}">${vText}</td>` : ''}
+          <td>${s.peakDps.toFixed(0)}</td>
+          <td>${s.peakG.toFixed(2)}</td>
+          <td>${s.durationMs.toFixed(0)}</td>
+          <td>${s.speedKmh.toFixed(1)}</td>
+          ${hasVideoInMemory ? `<td><button type="button" class="btn btn-ghost btn-sm btn-rep-swing" data-idx="${i}">▶ Replay</button></td>` : ''}
+        </tr>`;
+      }).join('')}</tbody></table></div>` : '<p class="muted">No swings detected in this session.</p>'}
     </section>
     <div class="actions" style="margin-top:16px">
       <a class="btn btn-primary" href="#home">Back to dashboard</a>
@@ -562,6 +1298,68 @@ async function renderReport(id, token) {
   $('rep-del')?.addEventListener('click', () => removeSession(rec, true));
   $('rep-retry')?.addEventListener('click', async () => {
     try { await saveSession(rec); unsaved.delete(rec.id); banner(''); toast('Session saved.'); renderReport(rec.id, routeToken); } catch (e) { toast(`Save failed: ${e.message}`, 'bad'); }
+  });
+
+  if (hasVideoInMemory) {
+    const ext = rec.video?.mimeType?.includes('mp4') ? 'mp4' : 'webm';
+    const repVid = $('rep-replay-video');
+    const repCanvas = $('rep-replay-pose-canvas');
+
+    if (repVid && repCanvas) {
+      ensureReplayPose(repVid, repCanvas, updateReportPoseIndicators);
+    }
+
+    $('rep-pose-toggle')?.addEventListener('click', () => {
+      replayPoseOverlayVisible = !replayPoseOverlayVisible;
+      toast(replayPoseOverlayVisible ? 'Pose overlay enabled on replay.' : 'Pose overlay hidden.');
+      if (repVid && repCanvas) {
+        renderReplayPoseFrame(repVid, repCanvas, updateReportPoseIndicators);
+      }
+    });
+
+    $('rep-dl-video')?.addEventListener('click', () => {
+      download(`${fileBase(rec)}.${ext}`, mediaEntry.blob, mediaEntry.blob.type || 'video/webm');
+      mediaStore.markDownloaded(rec.id);
+    });
+
+    const repSlider = $('rep-cal-slider');
+    repSlider?.addEventListener('input', (e) => {
+      const val = Number(e.target.value);
+      rec.video.calibrationOffsetMs = val;
+      const vEl = $('rep-cal-val');
+      if (vEl) vEl.textContent = `${val >= 0 ? '+' : ''}${val} ms`;
+
+      box.querySelectorAll('.rep-video-cell').forEach((cell) => {
+        const base = Number(cell.dataset.baseVideoS);
+        if (Number.isFinite(base)) {
+          cell.textContent = `${Math.max(0, base + val / 1000).toFixed(2)}s`;
+        }
+      });
+
+      if (activeReportSwingIdx >= 0 && rec.swings[activeReportSwingIdx]) {
+        const sw = rec.swings[activeReportSwingIdx];
+        const base = sw.videoS ?? (sw.t / 1000);
+        const target = Math.max(0, base + val / 1000);
+        if (repVid && repVid.readyState >= 2) {
+          repVid.currentTime = target;
+        }
+      }
+    });
+
+    box.querySelectorAll('.btn-rep-swing').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const idx = Number(btn.dataset.idx);
+        replayReportSwing(rec, idx);
+      });
+    });
+  }
+
+  $('rep-attach-video-btn')?.addEventListener('click', () => {
+    const fi = $('video-attach-file');
+    if (fi) {
+      fi._attachSessionId = rec.id;
+      fi.click();
+    }
   });
 
   box.querySelectorAll('.chart-card-interactive').forEach((card) => {
@@ -597,6 +1395,45 @@ function updateModalRangeLabel() {
   const total = modalChart._totalDurationS || 0;
   const el = $('modal-chart-range');
   if (el) el.textContent = `Visible: ${min.toFixed(2)} s – ${max.toFixed(2)} s (Total: ${total.toFixed(1)} s)`;
+}
+
+function replayReportSwing(rec, idx) {
+  if (!rec || !rec.swings || idx < 0 || idx >= rec.swings.length) return;
+  activeReportSwingIdx = idx;
+  const s = rec.swings[idx];
+  const video = $('rep-replay-video');
+  const canvas = $('rep-replay-pose-canvas');
+  const title = $('rep-selected-title');
+  if (title) title.textContent = `Swing #${idx + 1} at ${(s.t / 1000).toFixed(2)}s (${fmt(s.speedKmh)} km/h)`;
+
+  if (s.pose && s.pose.indicators) {
+    updateReportPoseIndicators(s.pose);
+  } else {
+    updateReportPoseIndicators(null);
+  }
+
+  if (!video) return;
+  if (canvas) {
+    ensureReplayPose(video, canvas, updateReportPoseIndicators);
+  }
+
+  const calOffset = rec.video?.calibrationOffsetMs || 0;
+  const baseVideoS = s.videoS ?? (s.t / 1000);
+  const targetVideoS = Math.max(0, baseVideoS + (calOffset / 1000));
+
+  const preS = 1.5;
+  const postS = 1.5;
+  const win = replayWindow(targetVideoS, preS, postS, video.duration || Infinity);
+  if (win && Number.isFinite(win.startS)) {
+    video.currentTime = win.startS;
+    video.play().catch(() => {});
+    if (reportReplayTimer) clearTimeout(reportReplayTimer);
+    const playMs = (win.endS - win.startS) * 1000;
+    reportReplayTimer = setTimeout(() => {
+      video.pause();
+      video.currentTime = targetVideoS;
+    }, playMs);
+  }
 }
 
 function openExpandedChart(kind, rec) {
@@ -650,6 +1487,7 @@ async function removeSession(rec, fromReport) {
   const ok = await confirmDialog('Delete session?', `“${rec.name || sportLabel(rec.sport)}” from ${new Date(rec.startedAt).toLocaleString()} will be permanently deleted from this browser. Export it first if you want a backup.`, 'Delete');
   if (!ok) return;
   try {
+    mediaStore.discard(rec.id);
     await deleteSession(rec.id);
     unsaved.delete(rec.id);
     toast('Session deleted.');
@@ -760,6 +1598,9 @@ function route() {
     destroyReportCharts();
     closeExpandedChart();
   }
+  if (name !== 'live' && active && !stopping) {
+    stopSession();
+  }
   if (!(active && active.mode === 'live') && live.wantOpen && name !== 'setup' && name !== 'home') live.disconnect();
   updateChrome();
   window.scrollTo(0, 0);
@@ -829,8 +1670,162 @@ function init() {
     closeExpandedChart();
   });
 
+  // Live camera, pose and timeline replay controls
+  $('btn-cam-enable')?.addEventListener('click', async () => {
+    if (!recorder) recorder = new VideoRecorder({ video: CONFIG.video, onChange: () => updateCameraUi() });
+    const ok = await recorder.openCamera();
+    if (ok && recorder.stream) {
+      const v = $('live-webcam-video');
+      if (v) { v.srcObject = recorder.stream; v.play().catch(() => {}); }
+      if (active && (active.state === 'running' || active.state === 'paused')) {
+        recorder.startRecording(sessionOriginPerf);
+        if (active.state === 'paused') recorder.pause();
+      }
+    }
+    updateCameraUi();
+  });
+
+  $('btn-cam-synth')?.addEventListener('click', () => {
+    if (!recorder) recorder = new VideoRecorder({ video: CONFIG.video, onChange: () => updateCameraUi() });
+    if (syntheticCam) { syntheticCam.stop(); syntheticCam = null; }
+    syntheticCam = createSyntheticCamera({
+      getMotion: () => latest ? { t: latest[0], gyroMag: magnitude(latest[4], latest[5], latest[6]), accelMag: magnitude(latest[1], latest[2], latest[3]) } : null,
+    });
+    if (syntheticCam) {
+      recorder.attachStream(syntheticCam.stream, 'synthetic');
+      const v = $('live-webcam-video');
+      if (v) { v.srcObject = syntheticCam.stream; v.play().catch(() => {}); }
+      if (active && (active.state === 'running' || active.state === 'paused')) {
+        recorder.startRecording(sessionOriginPerf);
+        if (active.state === 'paused') recorder.pause();
+      }
+    }
+    updateCameraUi();
+  });
+
+  $('btn-cam-toggle')?.addEventListener('click', async () => {
+    if (!recorder) return;
+    if (recorder.hasStream) {
+      recorder.closeCamera(true);
+      if (syntheticCam) { syntheticCam.stop(); syntheticCam = null; }
+      const v = $('live-webcam-video');
+      if (v) v.srcObject = null;
+    } else {
+      const ok = await recorder.openCamera();
+      if (ok && recorder.stream) {
+        const v = $('live-webcam-video');
+        if (v) { v.srcObject = recorder.stream; v.play().catch(() => {}); }
+        if (active && active.state === 'running') recorder.startRecording(sessionOriginPerf);
+      }
+    }
+    updateCameraUi();
+  });
+
+  $('btn-pose-toggle')?.addEventListener('click', () => {
+    poseOverlayVisible = !poseOverlayVisible;
+    toast(poseOverlayVisible ? 'Pose overlay enabled.' : 'Pose overlay hidden.');
+    if (!poseOverlayVisible) {
+      const canvas = $('live-pose-canvas');
+      const ctx = canvas?.getContext('2d');
+      ctx?.clearRect(0, 0, canvas?.width || 0, canvas?.height || 0);
+    }
+  });
+
+  $('btn-replay-swing')?.addEventListener('click', () => {
+    if (activeLiveReplayIndex >= 0) selectLiveSwing(activeLiveReplayIndex);
+  });
+
+  $('btn-replay-pose-toggle')?.addEventListener('click', () => {
+    replayPoseOverlayVisible = !replayPoseOverlayVisible;
+    toast(replayPoseOverlayVisible ? 'Pose overlay enabled on replay.' : 'Pose overlay hidden.');
+    const v = $('replay-video');
+    const c = $('replay-pose-canvas');
+    if (v && c) renderReplayPoseFrame(v, c, updatePoseIndicatorsDisplay);
+  });
+
+  $('btn-close-replay')?.addEventListener('click', () => {
+    const wrap = $('swing-replay-wrap');
+    if (wrap) wrap.hidden = true;
+    activeLiveReplayIndex = -1;
+    stopReplayPose($('replay-video'));
+    updateLiveSwingTimeline();
+  });
+
+  $('swing-timeline-bar')?.addEventListener('click', (e) => {
+    if (!liveSwings.length) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const pct = Math.max(0, Math.min(1, clickX / rect.width));
+    const totalDuration = Math.max(1000, active ? active.durationMs : 1000);
+    const targetT = pct * totalDuration;
+
+    let closestIdx = 0;
+    let minDiff = Infinity;
+    for (let i = 0; i < liveSwings.length; i++) {
+      const diff = Math.abs(liveSwings[i].t - targetT);
+      if (diff < minDiff) {
+        minDiff = diff;
+        closestIdx = i;
+      }
+    }
+    selectLiveSwing(closestIdx);
+  });
+
+  $('swing-chips')?.addEventListener('click', (e) => {
+    const chip = e.target.closest('.swing-chip');
+    if (chip && chip.dataset.idx !== undefined) {
+      selectLiveSwing(Number(chip.dataset.idx));
+    }
+  });
+
+  $('cal-offset-slider')?.addEventListener('input', (e) => {
+    calibrationOffsetMs = Number(e.target.value);
+    const valEl = $('cal-offset-val');
+    if (valEl) valEl.textContent = `${calibrationOffsetMs >= 0 ? '+' : ''}${calibrationOffsetMs} ms`;
+    if (activeLiveReplayIndex >= 0 && liveSwings[activeLiveReplayIndex]) {
+      const s = liveSwings[activeLiveReplayIndex];
+      const vm = sensorTimeToVideo(s.t, clockMap, recorder?.timeline, calibrationOffsetMs, active ? active.durationMs : null);
+      if (vm.videoS !== null) {
+        const video = $('replay-video');
+        if (video && video.readyState >= 2) {
+          video.currentTime = vm.videoS;
+        }
+      }
+    }
+  });
+
+  const attachInput = $('video-attach-file');
+  attachInput?.addEventListener('change', async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    const sessionId = attachInput._attachSessionId || activeReportRec?.id;
+    if (!sessionId) { toast('No active session to attach video to.', 'warn'); return; }
+    try {
+      mediaStore.put(sessionId, file, {
+        mimeType: file.type || 'video/webm',
+        durationS: null,
+        recorded: true,
+      });
+      toast('Video attached for this session.');
+      if (currentView === 'report' && activeReportRec?.id === sessionId) {
+        renderReport(sessionId, routeToken);
+      }
+    } catch (err) {
+      toast(`Failed to attach video: ${err.message}`, 'bad');
+    }
+  });
+
   window.addEventListener('hashchange', route);
-  window.addEventListener('beforeunload', (e) => { if (active) { e.preventDefault(); e.returnValue = ''; } });
+  window.addEventListener('beforeunload', (e) => {
+    if (active) { e.preventDefault(); e.returnValue = ''; }
+    mediaStore.discardAll();
+    stopReplayPose();
+    stopPoseLoop();
+    recorder?.closeCamera(true, true);
+    recorder?.dispose();
+    poseTracker?.dispose();
+  });
   if (!window.Chart) banner('Chart.js failed to load. Start the app with "npm start" and open the printed address (do not open index.html directly).');
   if (settings.mode === 'live') live.connect(settings.host, settings.port);
   route();

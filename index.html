@@ -104,6 +104,27 @@
             <label class="rcard"><input type="radio" name="mode" value="live"><span><strong>Live Hardware Mode</strong><small>Real MPU6050 readings from the ESP8266.</small></span></label>
           </div>
         </fieldset>
+        <fieldset class="equip-config">
+          <legend>Webcam &amp; Computer Vision</legend>
+          <p class="muted small" style="margin: 0 0 10px;">Record synchronized video and track body pose locally on your laptop. Video is never uploaded to any server or cloud service.</p>
+          <div class="row">
+            <label class="field grow">
+              <span>Camera input</span>
+              <select id="setup-camera-mode" class="select-input">
+                <option value="none">No camera (sensor only)</option>
+                <option value="webcam" selected>Laptop Webcam (browser recording)</option>
+                <option value="synthetic">Synthetic Demo Camera (test without webcam)</option>
+              </select>
+            </label>
+            <label class="field grow" style="align-self: center; margin-top: 18px;">
+              <label class="checkbox-label">
+                <input id="setup-pose-enable" type="checkbox" checked>
+                <span>Enable MediaPipe Pose Estimation <small>(local WASM inference)</small></span>
+              </label>
+            </label>
+          </div>
+          <p id="setup-cam-support-note" class="muted small" style="margin: 8px 0 0;"></p>
+        </fieldset>
         <div id="live-settings" class="live-settings" hidden>
           <div class="row">
             <label class="field grow"><span>ESP8266 IP address</span><input id="setup-host" type="text" inputmode="decimal" placeholder="192.168.1.50" autocomplete="off"></label>
@@ -157,6 +178,125 @@
           <div class="stat"><span class="stat-l">Last swing</span><span id="st-last" class="stat-v">—</span><span id="st-last-u" class="stat-u">&nbsp;</span></div>
         </div>
 
+        <!-- WEBCAM & POSE SECTION -->
+        <section id="live-cam-card" class="card live-cam-card" style="margin-bottom: 16px;">
+          <div class="cam-card-header">
+            <div>
+              <h2 class="card-title" style="margin:0;">Webcam &amp; Pose Analysis</h2>
+              <p class="muted small" id="cam-status-desc">Local video recording &amp; MediaPipe skeleton tracking.</p>
+            </div>
+            <div class="cam-badges">
+              <span id="badge-cam-state" class="badge badge-off">Camera: Off</span>
+              <span id="badge-pose-state" class="badge badge-off">Pose: Idle</span>
+              <span id="badge-video-size" class="badge badge-off" hidden>0 MB</span>
+            </div>
+          </div>
+
+          <div id="cam-warning-box" class="notice notice-warn" hidden></div>
+
+          <div class="cam-layout">
+            <div class="cam-preview-wrap">
+              <video id="live-webcam-video" playsinline muted autoplay></video>
+              <canvas id="live-pose-canvas"></canvas>
+              <div id="cam-placeholder" class="cam-placeholder">
+                <span style="font-size: 2.2rem;">📹</span>
+                <p style="margin: 6px 0;">Webcam preview is off</p>
+                <div class="actions">
+                  <button id="btn-cam-enable" class="btn btn-primary btn-sm" type="button">Enable Webcam</button>
+                  <button id="btn-cam-synth" class="btn btn-ghost btn-sm" type="button">Use Synthetic Demo Camera</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="cam-sidebar">
+              <div class="cam-toolbar">
+                <button id="btn-cam-toggle" class="btn btn-ghost btn-sm" type="button">Disable Camera</button>
+                <button id="btn-pose-toggle" class="btn btn-ghost btn-sm" type="button">Toggle Pose Overlay</button>
+                <select id="cam-device-select" class="select-input select-sm" hidden></select>
+              </div>
+
+              <div class="pose-indicators-card">
+                <div class="indicators-header">
+                  <span class="stat-l">Live Pose Indicators</span>
+                  <span id="pose-conf-badge" class="badge badge-off">Confidence: —</span>
+                </div>
+                <div class="grid-indicators">
+                  <div class="ind-item"><span class="ind-l">Left Elbow</span><b id="ind-le">—</b></div>
+                  <div class="ind-item"><span class="ind-l">Right Elbow</span><b id="ind-re">—</b></div>
+                  <div class="ind-item"><span class="ind-l">Torso Lean</span><b id="ind-torso">—</b></div>
+                  <div class="ind-item"><span class="ind-l">Left Knee</span><b id="ind-lk">—</b></div>
+                  <div class="ind-item"><span class="ind-l">Right Knee</span><b id="ind-rk">—</b></div>
+                  <div class="ind-item"><span class="ind-l">Shoulder Tilt</span><b id="ind-st">—</b></div>
+                </div>
+                <p class="muted" style="font-size: 11px; margin: 8px 0 0; line-height: 1.3;">
+                  2D camera indicators only (not medical advice or definitive 3D biomechanics). Measurements depend on camera viewing angle.
+                </p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- SWING TIMELINE & SYNCHRONIZED REPLAY -->
+        <section id="live-timeline-card" class="card" style="margin-bottom: 16px;">
+          <div class="timeline-card-header">
+            <div>
+              <h2 class="card-title" style="margin:0;">Detected Swings Timeline &amp; Video Sync</h2>
+              <p class="muted small">Select any swing to align video playback with sensor graphs.</p>
+            </div>
+            <div class="sync-controls">
+              <label class="pad-control" title="Time to show before swing peak">
+                <span>Pre-swing:</span>
+                <input id="sync-pad-pre" type="number" min="0.2" max="10" step="0.1" value="1.5" class="input-xs"> s
+              </label>
+              <label class="pad-control" title="Time to show after swing peak">
+                <span>Post-swing:</span>
+                <input id="sync-pad-post" type="number" min="0.2" max="10" step="0.1" value="1.5" class="input-xs"> s
+              </label>
+            </div>
+          </div>
+
+          <div id="swing-timeline-bar" class="swing-timeline-bar" role="slider" aria-label="Swing timeline" tabindex="0">
+            <div id="swing-timeline-track" class="swing-timeline-track"></div>
+            <div id="swing-timeline-playhead" class="swing-timeline-playhead"></div>
+          </div>
+
+          <div id="swing-chips" class="swing-chips" role="group" aria-label="Detected swings list">
+            <span class="muted small">No swings detected yet. Swing the equipment to see synchronized events here.</span>
+          </div>
+
+          <div id="swing-replay-wrap" class="swing-replay-wrap" hidden>
+            <div class="replay-player-row">
+              <div class="replay-video-box">
+                <video id="replay-video" playsinline controls></video>
+                <canvas id="replay-pose-canvas"></canvas>
+              </div>
+              <div class="replay-info-box">
+                <h3 id="replay-swing-title" style="font-size:1.05rem; margin-bottom: 6px;">Swing #1 Details</h3>
+                <div id="replay-stats" class="grid g-stats" style="grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 10px;">
+                  <!-- Filled dynamically -->
+                </div>
+                <div class="calibration-row">
+                  <label class="field" style="width: 100%;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                      <span class="small"><b>Sync Calibration:</b> <b id="cal-offset-val">0 ms</b></span>
+                      <span id="sync-uncertainty-badge" class="muted small" title="Estimated bound based on 50 Hz sensor sampling and 30 fps video. Precision is an estimate unless measured against a reference.">Precision: ±35 ms</span>
+                    </div>
+                    <input id="cal-offset-slider" type="range" min="-500" max="500" step="10" value="0" aria-label="Sync calibration offset in milliseconds">
+                    <p class="muted small sync-help-text" style="font-size: 11px; margin: 4px 0 0; line-height: 1.35;">
+                      <strong>Offset direction:</strong> <b>+ms</b> shifts video playback later (if visual swing lags the sensor peak); <b>−ms</b> shifts earlier. <em>Precision</em> is an estimate based on sample/frame periods.
+                    </p>
+                  </label>
+                </div>
+                <div class="actions" style="margin-top: 10px; flex-wrap: wrap;">
+                  <button id="btn-replay-swing" class="btn btn-primary btn-sm" type="button">↺ Replay Swing</button>
+                  <button id="btn-replay-pose-toggle" class="btn btn-ghost btn-sm" type="button">Toggle Pose Overlay</button>
+                  <button id="btn-close-replay" class="btn btn-ghost btn-sm" type="button">✕ Close Replay</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
         <div class="grid g2">
           <section class="card" aria-labelledby="acc-title">
             <h2 id="acc-title" class="card-title">Accelerometer <small>(g)</small></h2>
@@ -204,6 +344,7 @@
   </main>
 
   <input id="import-file" type="file" accept=".json,application/json" hidden>
+  <input id="video-attach-file" type="file" accept="video/webm,video/mp4" hidden>
   <dialog id="confirm" aria-labelledby="confirm-title">
     <form method="dialog">
       <h2 id="confirm-title">Confirm</h2>
